@@ -390,6 +390,7 @@ def run_inference(
 
             # Try to compile the model
             with ctx_log(tag="model compilation", enable_timing=True):
+            # 包装器保留原模型，负责在运行时选择普通 forward 或 CUDA graph replay
                 model = CUDAGraphModelWrapper(model)
                 if cuda_graph:
                     model.eager_cuda_graph_mode(

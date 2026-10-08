@@ -138,16 +138,22 @@ class SpecScheduler(BaseScheduler):
         Collect all needed metadata for model forward.
         Collect common variable first, then call specialized function.
         """
-        token_ids = array.array("i")
-        token_indptr = array.array("i", [0])
+        token_ids = array.array("i")#紧凑数组比Python内置的list更省内存'i': int32;'q':int64
+        #前缀和
+        token_indptr = array.array("i", [0])#初始值为[0]
+        #位置偏移
         pos_offsets = array.array("i")
 
+        # 所有KV索引
         all_kv_indices = array.array("i")
+        #所有KV索引的前缀和
         all_kv_indptr = array.array("i", [0])
+        #KV长度数组那请求存[3,1,4]batch中每个请求的kv长度
         kv_len_arr = array.array("i")
+        #按token存储[3,3,3,1,4,4,4,4]
         all_kv_len_arr = array.array("i")
 
-        # for token-probs scatter
+        # for token-probs scatter，：把一次批量 forward 得到的草稿概率，分发到各请求自己的 draft_probs 缓冲。
         probs_src_start_pos = array.array("i")
         probs_token_num_list = array.array("i")
         probs_tgt_tensor_ptrs = array.array("q")
@@ -157,8 +163,8 @@ class SpecScheduler(BaseScheduler):
             # Handle verification mode specially
             if request.status == Request.ReqExecType.VERIFY:
                 # include bonus token
-                num_tokens = self.spec_stride + 1 - request.initial_idx
-                request.kv_cache_ptr.allocate_tokens(1)
+                num_tokens = self.spec_stride + 1 - request.initial_idx #initial_idx是为了分配不同的起点，错开verify，避免集中验证
+                request.kv_cache_ptr.allocate_tokens(1) #只有最后生成的d4尚无KV槽位。
             elif request.status in (
                 Request.ReqExecType.DRAFT,
                 Request.ReqExecType.NORMAL,
@@ -168,10 +174,11 @@ class SpecScheduler(BaseScheduler):
                     request.len_token_ids - request.len_kv_cache,
                     self._args["chunk_size"],
                 )
+                #修改了len_kv_cache后，必须分配kv槽位，否则会报错
                 request.kv_cache_ptr.allocate_tokens(num_tokens)
                 if request.status == Request.ReqExecType.DRAFT:
-                    assert request.draft_probs is not None
-                    assert request.len_draft_probs < request.draft_probs.shape[0]
+                    assert request.draft_probs is not None  
+                    assert request.len_draft_probs < request.draft_probs.shape[0] #已经写入多少个draft token的概率小于tensor的最大数量
                     assert num_tokens == 1
 
                     probs_src_start_pos.append(token_indptr[-1])
@@ -241,8 +248,8 @@ class SpecScheduler(BaseScheduler):
 
         # collect spec kv metadata w/ in-place update
         self.spec_cache_class.dispatch_prepare_fwd_metadata(
-            input_metadata=input_metadata,
-            input_metadata_tensors=input_metadata_tensors,
+            input_metadata=input_metadata, # CPU侧记录，供调度和结果处理使用
+            input_metadata_tensors=input_metadata_tensors, #GPU输入及辅助字段，供forward 使用
             active_requests=self.active_requests,
             device=self.model.device,
         )
@@ -250,7 +257,7 @@ class SpecScheduler(BaseScheduler):
         # NOTE (Yilong): save in `spec-cache-args` rather than `input_metadata`
         # as `normal->draft` and `verify/stall->draft` has different cycles
         # `normal->draft` uses current stage; while `verify/stall->draft` uses previous stage
-        # we save STALL metadata twice to solve this
+        # we save STALL metadata twice to solve this ？？
         self.spec_cache_args.update(
             {
                 "all_kv_indices_gpu": input_metadata_tensors["all_kv_indices"],
@@ -316,13 +323,14 @@ class SpecScheduler(BaseScheduler):
         """
         completed_requests: List[Request] = []
         remaining_requests: List[Request] = []
-
+        #取得token IDs
         gen_token_ids_cpu = (
             gen_token_ids_gpu.cpu().numpy() if gen_token_ids_gpu is not None else None
         )
 
         # 1. Scatter the generated token probs from draft requests
         # as there bufs are never offloaded, we just use the collected metadata from last cycle
+        #由于这个缓冲区不存在卸载所以我们只需要每次把这个probs分发到各个请求的draft_probs缓冲区即可
         if input_metadata is not None:
             probs_src_start_pos = input_metadata["probs_src_start_pos"]
             probs_token_num_list = input_metadata["probs_token_num_list"]
@@ -340,6 +348,7 @@ class SpecScheduler(BaseScheduler):
 
         # 2. Gathering the necessary data for batched verification,
         # including draft_token_ids, bonus_token_id, draft_probs, and target_probs
+        #对需要verify的请求进行数据收集，主要是为了后续的rejection sampling做准备
         nvtx.range_push("Gathering metadata for verification")
         draft_token_ids_host = array.array("i")
         num_draft_tokens_host = array.array("i", [0])  # for cumsum
@@ -436,7 +445,7 @@ class SpecScheduler(BaseScheduler):
             )
             nvtx.range_pop()
 
-            # 4. parse the output into per-request format
+            # 4. parse the output into per-request format；将结果转成按请求组织的CPU token列表
             nvtx.range_push("Parse output into per-request format")
             output_token_ids_host = RejectionSampler.parse_output(
                 output_token_ids=output_token_ids_device,

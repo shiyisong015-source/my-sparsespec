@@ -51,12 +51,12 @@ class KVPool:
         self.page_size = page_size
         self.device = device
         self.vocab_size = config.vocab_size  # for draft probs
-
+        #分配GPU物理内存，shape=[层数，KV容量，2，页大小，KV头数，head维度]
         self._physical_mem_gpu = torch.empty(
             (
                 self.num_layers,
-                self.capacity,
-                2,
+                self.capacity,#物理页数
+                2,# K/V
                 self.page_size,
                 self.num_kv_heads,
                 self.head_dim,
@@ -321,9 +321,9 @@ class Transformer(nn.Module):
             x = self.ccl.all_reduce(x)
 
         for block in self.layers:
-            x = block(x)
-        x = self.norm(x)
-        logits = self.lm_head(x)
+            x = block(x)#前向传播
+        x = self.norm(x)#归一化
+        logits = self.lm_head(x)#词表分数
 
         # below shards lm-head in TP way
         if self.process_group is not None:
@@ -622,28 +622,29 @@ class Attention(nn.Module):
         del self.v_proj
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        seqlen, _ = x.shape
+        seqlen, _ = x.shape #本轮所有请求战平后的输入token数
 
         if hasattr(self, "wqkv"):
             q_size = self.num_qo_heads * self.head_dim
             kv_size = self.num_kv_heads * self.head_dim
-            q, k, v = self.wqkv(x).split([q_size, kv_size, kv_size], dim=-1)
+            q, k, v = self.wqkv(x).split([q_size, kv_size, kv_size], dim=-1)#沿着最后一个维度切分成q,k,v
             q = q.view(seqlen, self.num_qo_heads, self.head_dim)
             k = k.view(seqlen, self.num_kv_heads, self.head_dim)
             v = v.view(seqlen, self.num_kv_heads, self.head_dim)
         else:
-            q = self.q_proj(x).view(seqlen, self.num_qo_heads, self.head_dim)
+            q = self.q_proj(x).view(seqlen, self.num_qo_heads, self.head_dim)#按照head i进行整理
             k = self.k_proj(x).view(seqlen, self.num_kv_heads, self.head_dim)
             v = self.v_proj(x).view(seqlen, self.num_kv_heads, self.head_dim)
 
-        # Optional per-head RMSNorm on q/k (e.g., Qwen3). Apply before RoPE.
+        # Optional per-head RMSNorm on q/k (e.g., Qwen3). Apply before RoPE. Q,K做归一化处理
         if getattr(self, "q_norm", None) is not None:
             q = self.q_norm.forward_qk(q)
         if getattr(self, "k_norm", None) is not None:
             k = self.k_norm.forward_qk(k)
 
-        # Rope + append KV cache
+        # Rope + append KV cache 加入位置信息
         q, k = self.kv_cache.apply_batch_rope(q, k, self.config)
+        #把本轮的kv缓存加入到kv_cache中，供后续的attention使用
         self.kv_cache.append_batch_kv_cache(k, v, self.layer_idx)
 
         # perform computation

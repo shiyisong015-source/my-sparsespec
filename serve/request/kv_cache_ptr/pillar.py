@@ -45,11 +45,13 @@ class PillarCachePtr(StreamingCachePtr):
 
         # init buffers
         # these are double buffer used to avoid race condition w/ cuda graph
+        #稀疏KV的物理索引，[层数，KV头数，所有draft请求的索引总容量]
         cls.draft_kv_indices_tensor_buf = torch.empty(
             (cls.NUM_LAYERS, cls.NUM_KV_HEADS, cls.MAX_TOTAL_DRAFT_KV_LEN),
             dtype=torch.int32,
             device=kwargs["device"],
         )
+        # verify得到的attention分数快照[层数, KV head 数, 所有 verify 请求的 KV 分数总容量]
         cls.dump_logits_snapshot_tensor_buf = torch.empty(
             (cls.NUM_LAYERS, cls.NUM_KV_HEADS, cls.MAX_TOTAL_VERIFY_KV_LEN),
             dtype=torch.float16,

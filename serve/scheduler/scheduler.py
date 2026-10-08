@@ -102,7 +102,7 @@ class BaseScheduler:
 
     def add_request(self, request: Request, is_restore: bool = False) -> None:
         self.active_requests.append(request)
-
+    # 抢占机制
     def admit_requests(self, pending_requests: List[Request]) -> None:
         if self.admit_policy == "naive":
             assert False, "Naive policy is deprecated"
@@ -193,6 +193,7 @@ class BaseScheduler:
 
         elif self.admit_policy == "offloading":
             # Do not include chunk size here to leave headroom
+            #len_token_ids请求目前已有多少个token，len_kv_cache其中已有多少个位置分配了kv
             tokens_needed_sum = sum(
                 req.len_token_ids - req.len_kv_cache for req in self.active_requests
             )
@@ -202,10 +203,12 @@ class BaseScheduler:
 
             # Offload requests if needed
             if available_capacity < 0:
-                # Sort active requests by len_kv_cache
+                # Sort active requests by len_kv_cache 从大到小排序
                 self.active_requests.sort(key=lambda x: x.len_kv_cache, reverse=True)
                 nvtx.range_push("Offload requests")
+                
                 while available_capacity < 0:
+                    # 如果一个请求正在卸载就继续卸载而不是再调一个请求
                     if self.offloading_request:
                         self.offloading_request = self.offloading_request.offload()
 
@@ -219,6 +222,7 @@ class BaseScheduler:
                     else:
                         # NOTE: Temporary fix for the interupted matching issue
                         # this destory the strict monotonous
+                        # 从小到大卸载
                         request = None
                         for req in self.active_requests[::-1]:
                             if req.status == Request.ReqExecType.STALL:
@@ -558,7 +562,7 @@ class BaseScheduler:
             nvtx.range_pop()
 
             if input_metadata is not None:
-                # Feed in input metadata if input_metadata is not None
+                # Feed in input metadata if input_metadata is not None,把这些信息配置到attention后端
                 self.model.register_input(**input_metadata_tensors)
 
                 nvtx.range_push("Log scheduler metrics")
