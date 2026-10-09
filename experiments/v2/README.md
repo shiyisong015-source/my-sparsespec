@@ -91,7 +91,9 @@ only means its claimed jobs are done, not that other workers have finished.
   separate extension.
 - `rounds.jsonl`: accepted draft tokens exclude bonus; `step_id` links to the
   step where verification is consumed. Cold-start flags retain v1 meaning.
-- Committed tokens include bonus/normal tokens and must sum to final output.
+- Committed tokens include bonus/normal tokens, subtract the engine's EOS
+  truncation, and must sum to final output. `eos_trimmed_by_request` records
+  removed EOS/suffix tokens; raw verify acceptance remains in `rounds.jsonl`.
   Output-length overshoot inherited from the engine is retained and reported.
 - Mixed-batch GPU time belongs to the whole batch; it is not a per-request
   latency. Real workload comparisons must include prefill/offload and measured

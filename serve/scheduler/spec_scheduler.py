@@ -139,6 +139,11 @@ class SpecScheduler(BaseScheduler):
                 if request.token_ids[-i] in self.eos_token_id:
                     # clear tokens after the EOS token
                     request.token_ids = request.token_ids[:-i]
+                    if self.step_trace.enabled:
+                        self.step_trace.commit(request.request_id, -i)
+                        trims = self.step_trace.current.setdefault("eos_trimmed_by_request", {})
+                        key = str(request.request_id)
+                        trims[key] = trims.get(key, 0) + i
                     return True
             return False
         else:

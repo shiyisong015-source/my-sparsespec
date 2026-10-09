@@ -24,7 +24,10 @@ def validate(directory):
         if roundfile.exists():
             for s in roundfile.read_text().splitlines():
                 r=json.loads(s)
-                assert rows[r['step_id']]['committed_by_request'][str(r['request_id'])]==r['accepted_draft_tokens']+1
+                step = rows[r['step_id']]
+                key = str(r['request_id'])
+                trimmed = step.get('eos_trimmed_by_request', {}).get(key, 0)
+                assert step['committed_by_request'][key]==r['accepted_draft_tokens']+1-trimmed
     return output
 
 
