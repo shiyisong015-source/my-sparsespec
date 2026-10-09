@@ -72,8 +72,11 @@ class SpecScheduler(BaseScheduler):
         # Trying to permute the speculative steps
         # for unified batch scheudler
         if is_restore:
-            assert request.status != Request.ReqExecType.NORMAL
+            # Chunked prefill can be offloaded before NORMAL transitions to DRAFT.
+            # Its initial speculative index was assigned at first admission.
             assert request.initial_idx is not None
+            if request.status == Request.ReqExecType.NORMAL:
+                assert request.len_draft_probs == 0
         else:
             assert request.initial_idx is None
             if self._args["batch_policy"] == "random":
