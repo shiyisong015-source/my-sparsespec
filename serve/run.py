@@ -83,8 +83,13 @@ def run_base_scheduler(
     logger.info(f"Running BaseScheduler with args: {args}")
 
     worker = BaseScheduler(kv_pool, model, **args)
-    ret_reqs = worker.run(reqs)
-    return ret_reqs
+    successful = False
+    try:
+        ret_reqs = worker.run(reqs)
+        successful = True
+        return ret_reqs
+    finally:
+        worker.step_trace.close(successful)
 
 
 def run_spec_scheduler(
@@ -98,10 +103,13 @@ def run_spec_scheduler(
     logger.info(f"Running SpecScheduler with args: {args}")
 
     worker = SpecScheduler(kv_pool, model, **args)
+    successful = False
     try:
         ret_reqs = worker.run(reqs)
+        successful = True
     finally:
         worker.close_acceptance_log()
+        worker.step_trace.close(successful)
     return ret_reqs
 
 
@@ -162,6 +170,8 @@ def run_inference(
     vanilla_attn: bool = False,
     dataset_name: str = "unknown",
     enable_torch_profiler: bool = False,
+    step_log_path: str = None,
+    seed: int = 330,
 ):
     # Ensure logging is configured for library use
     if not logging.getLogger().hasHandlers():
@@ -236,7 +246,9 @@ def run_inference(
     torch.set_default_dtype(default_dtype)
 
     # reproducibility
-    setup_seed(330)
+    if step_log_path is not None and (async_cpu or tp_ranks != 1):
+        raise ValueError("Step timing currently requires async_cpu=False and tp_ranks=1")
+    setup_seed(seed)
 
     # allocate kv cache memory
     if max_mem_per_rank is None:
@@ -292,6 +304,8 @@ def run_inference(
         "enable_torch_profiler": enable_torch_profiler,
         "profiler_result_dir": result_dir,
         "acceptance_log_path": acceptance_log_path,
+        "step_log_path": step_log_path,
+        "seed": seed,
     }
 
     additional_args = {
@@ -627,6 +641,8 @@ if __name__ == "__main__":
     argparser.add_argument("--dataset_name", type=str, default="aime")
     argparser.add_argument("--result_dir", type=str, default=None)
     argparser.add_argument("--acceptance_log_path", type=str, default=None)
+    argparser.add_argument("--step_log_path", type=str, default=None)
+    argparser.add_argument("--seed", type=int, default=330)
     argparser.add_argument("--enable_wandb", action="store_true")
 
     # spec args
@@ -684,6 +700,8 @@ if __name__ == "__main__":
         debug=args.debug,
         result_dir=args.result_dir,
         acceptance_log_path=args.acceptance_log_path,
+        step_log_path=args.step_log_path,
+        seed=args.seed,
         vanilla_attn=args.vanilla_attn,
         dataset_name=args.dataset_name,
         enable_torch_profiler=args.enable_torch_profiler,

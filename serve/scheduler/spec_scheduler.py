@@ -308,6 +308,7 @@ class SpecScheduler(BaseScheduler):
             kv_len, draft_kv_len, cold_start = self.draft_start[request.request_id]
             record = {
                 "request_id": request.request_id,
+                "step_id": self.step_id,
                 "round": round_index,
                 "cold_start": cold_start,
                 "kv_len": kv_len,
@@ -319,6 +320,8 @@ class SpecScheduler(BaseScheduler):
             }
             self.acceptance_log.write(json.dumps(record) + "\n")
             self.acceptance_rounds[request.request_id] = round_index + 1
+
+        self.step_trace.commit(request.request_id, accepted_tokens)
 
         # maintain token-ids
         del request.token_ids[-spec_tokens_count:]
@@ -470,15 +473,17 @@ class SpecScheduler(BaseScheduler):
                 bonus_token_ids_host, dtype=torch.int32
             ).to(self.kv_pool.device, non_blocking=True)
 
-            output_token_ids_device = self.rejection_sampler(
-                draft_token_ids=draft_token_ids_device,
-                num_draft_tokens=num_draft_tokens_host[1:],
-                cu_num_draft_tokens=cu_num_draft_tokens_device[1:],
-                max_spec_len=RejectionSampler.MAX_SPEC_LEN,
-                draft_probs=draft_probs_tensor,
-                target_probs=target_probs_tensor,
-                bonus_token_ids=bonus_token_ids_device,
-            )
+            with self.step_trace.stage("rejection_sampling", gpu=True):
+                output_token_ids_device = self.rejection_sampler(
+                    draft_token_ids=draft_token_ids_device,
+                    num_draft_tokens=num_draft_tokens_host[1:],
+                    cu_num_draft_tokens=cu_num_draft_tokens_device[1:],
+                    max_spec_len=RejectionSampler.MAX_SPEC_LEN,
+                    draft_probs=draft_probs_tensor,
+                    target_probs=target_probs_tensor,
+                    bonus_token_ids=bonus_token_ids_device,
+                )
+
             nvtx.range_pop()
 
             # 4. parse the output into per-request format；将结果转成按请求组织的CPU token列表
@@ -645,13 +650,14 @@ class SpecScheduler(BaseScheduler):
 
         # Final step: update the selected indices for all requests at once
         nvtx.range_push("Update selected indices")
-        self.spec_cache_class.dispatch_update_selected_indices(
-            wrappers=self.kv_pool.wrappers,
-            selected_indices_metadatas=selected_indices_metadatas,
-            spec_cache_args=self.spec_cache_args,  # current stage
-            input_metadata=input_metadata,  # previous stage
-            device=self.kv_pool.device,
-        )
+        with self.step_trace.stage("kv_selection", gpu=True):
+            self.spec_cache_class.dispatch_update_selected_indices(
+                wrappers=self.kv_pool.wrappers,
+                selected_indices_metadatas=selected_indices_metadatas,
+                spec_cache_args=self.spec_cache_args,  # current stage
+                input_metadata=input_metadata,  # previous stage
+                device=self.kv_pool.device,
+            )
         nvtx.range_pop()
 
         # NOTE (Yilong): this is to log prev-step's idx

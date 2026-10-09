@@ -8,6 +8,7 @@ import torch.cuda.nvtx as nvtx
 
 from serve.model.model import KVPool
 from serve.profiler import Profiler
+from serve.step_trace import StepTrace
 from serve.request.request import Request
 from serve.sampling.sampler import Sampler, SamplingMetadata
 from serve.utils import (
@@ -46,6 +47,8 @@ class BaseScheduler:
         self.admit_policy = kwargs["admit_policy"]
         self.async_on = kwargs["async_cpu"]
         self._args = kwargs
+        self.step_id = -1
+        self.step_trace = StepTrace(kwargs.get("step_log_path"))
 
         # construct sampler
         self.sampler = Sampler(tp_ranks=kwargs["tp_ranks"])
@@ -544,9 +547,15 @@ class BaseScheduler:
         output_snapshot_barrier = None
         pbar = tqdm(total=total_requests, desc="Specgen inference")
         while pending_requests or self.active_requests or self.offload_requests:
+            self.step_id += 1
+            step_started = time.perf_counter()
+            if self.step_trace.enabled:
+                self.step_trace.begin(self.step_id)
+                offloaded_before = {r.request_id for r in self.offload_requests}
             # Admit new requests
             nvtx.range_push("Admit requests")
-            self.admit_requests(pending_requests)
+            with self.step_trace.stage("admit"):
+                self.admit_requests(pending_requests)
             nvtx.range_pop()
 
             assert (
@@ -558,9 +567,25 @@ class BaseScheduler:
             )
 
             nvtx.range_push("Prepare forward inputs")
-            input_metadata, input_metadata_tensors = self.prepare_forward_inputs()
+            if self.step_trace.enabled:
+                requests_before = list(self.active_requests)
+                normal_before = {r.request_id: r.len_token_ids for r in requests_before
+                                 if r.status == Request.ReqExecType.NORMAL}
+                request_rows = [{"request_id": r.request_id, "state": r.status.name,
+                                 "phase": ("prefill" if r.len_kv_cache < r.len_input else "decode") if r.status == Request.ReqExecType.NORMAL else r.status.name.lower(),
+                                 "kv_len": r.len_kv_cache, "draft_kv_len": r.len_loading_kv_cache,
+                                 "spec_stride": getattr(self, "spec_stride", 0),
+                                 "budget_ratio": getattr(self, "spec_cache_args", {}).get("budget_ratio")}
+                                for r in requests_before]
+                offloaded_after = {r.request_id for r in self.offload_requests}
+            with self.step_trace.stage("prepare", gpu=True):
+                input_metadata, input_metadata_tensors = self.prepare_forward_inputs()
             nvtx.range_pop()
 
+            if self.step_trace.enabled and input_metadata is not None:
+                pointers = input_metadata['token_indptr']
+                for idx, row in enumerate(request_rows):
+                    row['query_tokens'] = int(pointers[idx+1]-pointers[idx])
             if input_metadata is not None:
                 # Feed in input metadata if input_metadata is not None,把这些信息配置到attention后端
                 self.model.register_input(**input_metadata_tensors)
@@ -607,17 +632,19 @@ class BaseScheduler:
                     else torch.cuda.stream(torch.cuda.current_stream())
                 ):
                     # Actual model forward pass
-                    gen_padded_token_logits_tensor = self.model(
-                        **input_metadata_tensors
-                    )
+                    with self.step_trace.stage("model_forward", gpu=True):
+                        gen_padded_token_logits_tensor = self.model(
+                            **input_metadata_tensors
+                        )
                     # CUDA Graph could potentially return padded logits
                     # use sampler to clip out padded tokens
                     # Implement in a hacky way to leverage the TP-friendly layout
-                    gen_token_ids_tensor, gen_token_probs_tensor = self.sampler(
-                        logits=gen_padded_token_logits_tensor,
-                        sampling_metadata=self.sampling_metadata,
-                        clip_length=input_metadata_tensors["token_ids"].shape[0],
-                    )
+                    with self.step_trace.stage("sampling", gpu=True):
+                        gen_token_ids_tensor, gen_token_probs_tensor = self.sampler(
+                            logits=gen_padded_token_logits_tensor,
+                            sampling_metadata=self.sampling_metadata,
+                            clip_length=input_metadata_tensors["token_ids"].shape[0],
+                        )
                     # unbind graph output to avoid race condition
                     del gen_padded_token_logits_tensor
 
@@ -627,7 +654,8 @@ class BaseScheduler:
                     if output_snapshot_barrier is not None:
                         # sync to avoid race condition
                         output_snapshot_barrier.wait()
-                    input_metadata.update(self.kv_pool.output_snapshot(input_metadata))
+                    with self.step_trace.stage("kv_score_snapshot", gpu=True):
+                        input_metadata.update(self.kv_pool.output_snapshot(input_metadata))
                 nvtx.range_pop()
 
                 # If async is on, update the metadata on CPU on control stream
@@ -655,16 +683,17 @@ class BaseScheduler:
             gen_token_indptr = (
                 input_metadata["token_indptr"] if input_metadata is not None else None
             )
-            newly_completed_requests = self.update_requests(
-                gen_token_indptr,  # current iter
-                last_gen_token_ids_tensor if self.async_on else gen_token_ids_tensor,
-                (
-                    last_gen_token_probs_tensor
-                    if self.async_on
-                    else gen_token_probs_tensor
-                ),
-                last_gen_input_metadata if self.async_on else input_metadata,
-            )
+            with self.step_trace.stage("update_requests", gpu=True):
+                newly_completed_requests = self.update_requests(
+                    gen_token_indptr,  # current iter
+                    last_gen_token_ids_tensor if self.async_on else gen_token_ids_tensor,
+                    (
+                        last_gen_token_probs_tensor
+                        if self.async_on
+                        else gen_token_probs_tensor
+                    ),
+                    last_gen_input_metadata if self.async_on else input_metadata,
+                )
             completed_requests.extend(newly_completed_requests)
 
             last_gen_token_ids_tensor = gen_token_ids_tensor
@@ -687,6 +716,20 @@ class BaseScheduler:
                 # Specgen TPS is logged in Specgen's log_throughput_metrics
                 self.log_throughput_metrics(len(input_metadata["token_ids"]))
 
+            if self.step_trace.enabled:
+                for req in requests_before:
+                    if req.request_id in normal_before:
+                        self.step_trace.commit(req.request_id, req.len_token_ids-normal_before[req.request_id])
+                self.step_trace.finish(
+                    time.perf_counter()-step_started,
+                    step_start_perf_counter=step_started,
+                    active_batch=len(requests_before), requests=request_rows,
+                    query_tokens=len(input_metadata['token_ids']) if input_metadata else 0,
+                    pending_requests=len(pending_requests), offloaded_requests=len(self.offload_requests),
+                    offloaded_ids=sorted(offloaded_after-offloaded_before),
+                    restored_ids=sorted(offloaded_before-offloaded_after),
+                    kv_capacity_tokens=self.kv_pool.capacity*self.kv_pool.page_size,
+                    kv_free_tokens=self.kv_pool.num_free_pages*self.kv_pool.page_size)
             _end_timestamp = time.perf_counter()
             self.log_performance_metrics(_end_timestamp - _timestamp)
             _timestamp = _end_timestamp
