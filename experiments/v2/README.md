@@ -61,7 +61,9 @@ python external/SparseSpec/experiments/v2/run_sweep.py \
   --output external/SparseSpec/log/v2/screen-seed330
 ```
 
-Repeat with `--gpu 1` and `--gpu 2`. Screen = 36 sparse cases plus 3 AR cases.
+Repeat with the other allocated physical GPU indices; `--gpu` accepts any
+nonnegative index. Check allocation and occupancy before starting each worker.
+Screen = 36 sparse cases plus 3 AR cases.
 Confirm = 60 sparse cases plus 3 AR cases. Confirm is a separate explicit
 launch after reviewing the screening results. A worker's `complete` status
 only means its claimed jobs are done, not that other workers have finished.

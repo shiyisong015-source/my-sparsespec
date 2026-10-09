@@ -16,10 +16,12 @@ def main():
     p=argparse.ArgumentParser()
     p.add_argument('--request-file',type=Path,required=True)
     p.add_argument('--output',type=Path,required=True)
-    p.add_argument('--gpu',type=int,required=True,choices=[0,1,2])
+    p.add_argument('--gpu',type=int,required=True,help='Physical GPU index (nonnegative)')
     p.add_argument('--phase',choices=['screen','confirm'],default='screen')
     p.add_argument('--seed',type=int,default=330)
-    args=p.parse_args();args.output=args.output.resolve();args.output.mkdir(parents=True,exist_ok=True)
+    args=p.parse_args()
+    if args.gpu < 0:p.error('--gpu must be nonnegative')
+    args.output=args.output.resolve();args.output.mkdir(parents=True,exist_ok=True)
     request_file=args.request_file.resolve();sha=hashlib.sha256(request_file.read_bytes()).hexdigest()
     ks=[4,8,14] if args.phase=='screen' else [4,6,8,12,14]
     jobs=[(b,k,r,'sparse') for b in [4,16,32] for k in ks for r in [.05,.1,.15,.25]]
