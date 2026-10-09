@@ -1,6 +1,8 @@
 import array
+import json
 import logging
 import random
+from pathlib import Path
 from typing import List, Tuple, Type
 
 import numpy as np
@@ -47,6 +49,17 @@ class SpecScheduler(BaseScheduler):
         # init RejectionSampler
         assert self.spec_stride + 1 <= RejectionSampler.MAX_SPEC_LEN
         self.rejection_sampler = RejectionSampler()
+        self.acceptance_log = None
+        if kwargs.get("acceptance_log_path") is not None:
+            log_path = Path(kwargs["acceptance_log_path"])
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.acceptance_log = log_path.open("w", encoding="utf-8")
+        self.acceptance_rounds = {}
+        self.draft_start = {}
+
+    def close_acceptance_log(self) -> None:
+        if self.acceptance_log is not None:
+            self.acceptance_log.close()
 
     def add_request(self, request: Request, is_restore: bool = False) -> None:
         """
@@ -290,6 +303,23 @@ class SpecScheduler(BaseScheduler):
         assert accepted_tokens > 0  # at least one bonus token
         assert num_retracted_kv_cache_tokens >= 0
 
+        if self.acceptance_log is not None:
+            round_index = self.acceptance_rounds.get(request.request_id, 0)
+            kv_len, draft_kv_len, cold_start = self.draft_start[request.request_id]
+            record = {
+                "request_id": request.request_id,
+                "round": round_index,
+                "cold_start": cold_start,
+                "kv_len": kv_len,
+                "draft_kv_len": draft_kv_len,
+                "spec_stride": self.spec_stride,
+                "budget_ratio": self.spec_cache_args["budget_ratio"],
+                "actual_draft_tokens": spec_tokens_count,
+                "accepted_draft_tokens": accepted_tokens - 1,
+            }
+            self.acceptance_log.write(json.dumps(record) + "\n")
+            self.acceptance_rounds[request.request_id] = round_index + 1
+
         # maintain token-ids
         del request.token_ids[-spec_tokens_count:]
         request.token_ids.extend(output_token_ids)
@@ -299,6 +329,12 @@ class SpecScheduler(BaseScheduler):
         kwargs["num_accepted_tokens"] = accepted_tokens
         selected_indices_metadata = request.kv_cache_ptr.get_select_metadata(**kwargs)
         selected_indices_metadata["len_kv_indices"] = request.kv_cache_ptr.len_kv_cache
+        if self.acceptance_log is not None:
+            self.draft_start[request.request_id] = (
+                request.len_kv_cache,
+                request.kv_cache_ptr.len_loading_indices,
+                False,
+            )
 
         # log Specgen metrics
         self.log_throughput_metrics(
@@ -558,6 +594,12 @@ class SpecScheduler(BaseScheduler):
                             request.kv_cache_ptr, **self.spec_cache_args
                         )
                     )
+                    if self.acceptance_log is not None:
+                        self.draft_start[request.request_id] = (
+                            request.len_kv_cache,
+                            request.kv_cache_ptr.len_loading_indices,
+                            True,
+                        )
                     selected_indices_metadata["idx"] = idx
                     # assume normal directly go to draft. no previous stage
                     selected_indices_metadata["prev_idx"] = -1 if self.async_on else idx

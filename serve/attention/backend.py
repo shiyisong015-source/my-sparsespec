@@ -202,7 +202,7 @@ class BatchTopKAttention(BatchAttention):
         # dispatch to PersistentAttentionScorePersistent
         # choose both accurate and efficient `CTA_TILE_Q`
         _max_len_verify_packed_qo = num_qo_heads // num_kv_heads * self.MAX_SPEC_STRIDE
-        if _max_len_verify_packed_qo <= 48:
+        if _max_len_verify_packed_qo <= 32:
             self.DISPATCH_CTA_TILE_Q = 32
         else:
             self.DISPATCH_CTA_TILE_Q = 64

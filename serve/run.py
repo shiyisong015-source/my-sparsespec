@@ -98,7 +98,10 @@ def run_spec_scheduler(
     logger.info(f"Running SpecScheduler with args: {args}")
 
     worker = SpecScheduler(kv_pool, model, **args)
-    ret_reqs = worker.run(reqs)
+    try:
+        ret_reqs = worker.run(reqs)
+    finally:
+        worker.close_acceptance_log()
     return ret_reqs
 
 
@@ -155,6 +158,7 @@ def run_inference(
     gemm_profile_path: str = None,
     debug: bool = False,
     result_dir: str = None,
+    acceptance_log_path: str = None,
     vanilla_attn: bool = False,
     dataset_name: str = "unknown",
     enable_torch_profiler: bool = False,
@@ -287,6 +291,7 @@ def run_inference(
         "temperature": temperature,
         "enable_torch_profiler": enable_torch_profiler,
         "profiler_result_dir": result_dir,
+        "acceptance_log_path": acceptance_log_path,
     }
 
     additional_args = {
@@ -621,6 +626,7 @@ if __name__ == "__main__":
     argparser.add_argument("--clip_length", type=int, default=32 * 1024)
     argparser.add_argument("--dataset_name", type=str, default="aime")
     argparser.add_argument("--result_dir", type=str, default=None)
+    argparser.add_argument("--acceptance_log_path", type=str, default=None)
     argparser.add_argument("--enable_wandb", action="store_true")
 
     # spec args
@@ -677,6 +683,7 @@ if __name__ == "__main__":
         gemm_profile_path=args.gemm_profile_path,
         debug=args.debug,
         result_dir=args.result_dir,
+        acceptance_log_path=args.acceptance_log_path,
         vanilla_attn=args.vanilla_attn,
         dataset_name=args.dataset_name,
         enable_torch_profiler=args.enable_torch_profiler,

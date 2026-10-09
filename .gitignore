@@ -186,3 +186,6 @@ analysis/gemm_profile/output*
 *.json
 
 outputs/
+
+# Runtime research outputs are preserved explicitly in tagged snapshots.
+/log/
