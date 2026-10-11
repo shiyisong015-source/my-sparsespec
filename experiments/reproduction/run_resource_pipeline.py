@@ -13,6 +13,30 @@ RUNNER = Path(__file__).with_name("run_resource_case.py")
 PAIRS = [(0, 1), (2, 3), (4, 5), (6, 7)]
 
 
+def process_running(pid):
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        return state not in {"Z", "X"}
+    except FileNotFoundError:
+        return False
+
+
+class AttachedCase:
+    """Observe an existing launcher without restarting its CUDA workers."""
+    def __init__(self, pid, output, command):
+        self.pid, self.output = pid, Path(output)
+        if process_running(pid):
+            actual = Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+            if [value.decode() for value in actual] != command:
+                raise ValueError(f"PID {pid} no longer belongs to the saved case")
+
+    def poll(self):
+        if process_running(self.pid):
+            return None
+        report = json.loads((self.output / "launch.json").read_text())
+        return 0 if report["state"] == "complete" else report.get("exit_code") or 1
+
+
 def idle_pairs():
     raw = subprocess.check_output(["nvidia-smi", "--query-gpu=index,memory.used,utilization.gpu",
                                    "--format=csv,noheader,nounits"], text=True)
@@ -29,17 +53,20 @@ def main():
     parser.add_argument("--nsys", required=True, type=Path)
     parser.add_argument("--idle-grace-seconds", type=float, default=60)
     parser.add_argument("--preflights", nargs="+", type=Path, required=True)
+    parser.add_argument("--resume", action="store_true", help="Adopt saved cases after the old CPU controller exits")
+    parser.add_argument("--skip-full-case-gate", action="store_true", help="Expand after preflights, before the first full case finishes")
+    parser.add_argument("--max-parallel-jobs", type=int, choices=range(1, 5), default=4)
     args = parser.parse_args()
     output = args.output.resolve()
-    if not output.is_relative_to(REPO / "log") or output.exists():
-        parser.error("Use a new pipeline directory under SparseSpec/log")
+    if not output.is_relative_to(REPO / "log") or (output.exists() and not args.resume):
+        parser.error("Use a new pipeline directory under SparseSpec/log, or explicitly --resume")
     if not args.nsys.is_file() or args.idle_grace_seconds < 0:
         parser.error("Invalid nsys path/idle grace")
     for preflight in args.preflights:
         report = json.loads((preflight / "launch.json").read_text())
         if report["state"] != "complete":
             parser.error(f"Preflight has not passed: {preflight}")
-    output.mkdir(parents=True)
+    output.mkdir(parents=True, exist_ok=args.resume)
     ratios = [.05, .10, .15]
     first = dict(dataset="livecodebench", ratio=.05, kind="scan")
     scans = [dict(dataset=dataset, ratio=ratio, kind="scan")
@@ -57,12 +84,38 @@ def main():
     def key(job):
         return f"{job['kind']}-{job['dataset']}-r{job['ratio']:.2f}"
 
+    resumed_controller_pid = None
+    if args.resume:
+        previous = json.loads(status_path.read_text())
+        if process_running(previous["pid"]):
+            parser.error("Old CPU controller is still running; do not create two queue owners")
+        if previous["failed"]:
+            parser.error("Failed cases require review before resuming")
+        if previous["preflights"] != [str(path.resolve()) for path in args.preflights]:
+            parser.error("Resume must retain the same preflights")
+        jobs = {key(job): job for job in pending}
+        saved_names = previous["pending"] + previous["completed"] + list(previous["active"])
+        if len(saved_names) != len(jobs) or set(saved_names) != set(jobs):
+            parser.error("Saved queue does not match the experiment plan")
+        pending = [jobs[name] for name in previous["pending"]]
+        completed = list(previous["completed"])
+        for name, saved in previous["active"].items():
+            directory = Path(saved["output"])
+            if directory.resolve() != output / name:
+                parser.error("Saved case directory does not match the queue")
+            active[name] = dict(saved, output=directory, log=None,
+                                process=AttachedCase(saved["pid"], directory, saved["command"]))
+        resumed_controller_pid = previous["pid"]
+
     def save(state, error=None):
         report = dict(state=state, pid=os.getpid(), completed=completed, failed=failed,
                       pending=[key(job) for job in pending],
                       active={name: {k: str(v) if isinstance(v, Path) else v for k, v in item.items()
                                      if k not in {"process", "log"}} for name, item in active.items()},
                       idle_grace_seconds=args.idle_grace_seconds,
+                      max_parallel_jobs=args.max_parallel_jobs,
+                      skip_full_case_gate=args.skip_full_case_gate,
+                      resumed_controller_pid=resumed_controller_pid,
                       initial_full_case=key(first), preflights=[str(path.resolve()) for path in args.preflights])
         if error:
             report["error"] = str(error)
@@ -77,7 +130,8 @@ def main():
                 code = item["process"].poll()
                 if code is None:
                     continue
-                item["log"].close()
+                if item["log"] is not None:
+                    item["log"].close()
                 report = json.loads((item["output"] / "launch.json").read_text())
                 if code != 0 or report["state"] != "complete":
                     failed.append(dict(case=name, exit_code=code, output=str(item["output"])))
@@ -109,7 +163,9 @@ def main():
                         and not any(tuple(item["gpus"]) == pair for item in active.values())]
             eligible.sort(key=lambda pair: (PAIRS.index(pair) - pair_cursor) % len(PAIRS))
             for pair in eligible:
-                if not pending or (key(first) not in completed and active):
+                if not pending or len(active) >= args.max_parallel_jobs:
+                    break
+                if not args.skip_full_case_gate and key(first) not in completed and active:
                     break
                 # Profile a single GPU pair at a time to isolate the diagnostic timeline.
                 if any(item["kind"] == "nsys" for item in active.values()):

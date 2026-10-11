@@ -89,6 +89,8 @@ python experiments/reproduction/run_resource_pipeline.py \
 
 输出目录必须尚不存在。只使用持续空闲60秒的 GPU 对，轮换配置；失败保留并停止后续启动，不隐式降低参数。进度在 `pipeline-status.json`，每组运行日志在 `runtime.log`；主分析在 `analysis/`，快照分析在 `footprint-analysis/`。逐文件改动记录在 `log/reproduction/resource-motivation/code-review-2026-10-11/`。
 
+用户追加四张 GPU 后，当前扫描使用 `--skip-full-case-gate --max-parallel-jobs 3`：八组预检已通过即可扩展，最多三个 TP2 任务。已有任务接续还需 `--resume`，并先退出旧 CPU 控制进程；模型 worker 和当前单案例启动器保持运行。接续核对任务命令、PID、队列与预检来源，不重复生成样本。nsys 仍等待普通扫描全部结束后单独运行。并行扫描共享主机和 PCIe 资源，后续吞吐解释需保留执行并发信息；不能视为独占机器的测量。
+
 ### 测量边界
 
 - 普通吞吐扫描没有新增逐步 CUDA 同步。nsys 的窗口边界会等待两张卡，并调用 profiler API；窗口统计排除这些启动/停止开销，整个诊断运行的吞吐不参与排名。
