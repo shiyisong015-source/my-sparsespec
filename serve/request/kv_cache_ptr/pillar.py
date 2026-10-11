@@ -457,7 +457,14 @@ class PillarCachePtr(StreamingCachePtr):
         all_kv_indptr_cpu = spec_cache_args["all_kv_indptr_cpu"]
         all_kv_indices_gpu = spec_cache_args["all_kv_indices_gpu"]
 
-        num_verify_requests = request_type.count(Request.ReqExecType.VERIFY.value)
+        # Some verified requests have completed and no longer own a selection
+        # buffer. Size every launch from the actual surviving update tasks.
+        verify_metadatas = [
+            metadata for metadata in selected_indices_metadatas
+            if metadata["prev_idx"] >= 0
+            and request_type[metadata["prev_idx"]] == Request.ReqExecType.VERIFY.value
+        ]
+        num_verify_requests = len(verify_metadatas)
         if num_verify_requests == 0:
             # all selected_indices are from normal requests
             for metadata in selected_indices_metadatas:
@@ -472,7 +479,7 @@ class PillarCachePtr(StreamingCachePtr):
         selected_indices_ptrs = np.empty(num_verify_requests, dtype=np.int64)
 
         verify_idx = 0
-        for metadata in selected_indices_metadatas:
+        for metadata in verify_metadatas:
             idx = metadata["idx"]  # cur iter
             prev_idx = metadata["prev_idx"]  # prev iter
             if prev_idx == -1:
@@ -487,7 +494,7 @@ class PillarCachePtr(StreamingCachePtr):
                 verify_idx += 1
             else:
                 assert metadata["num_selected_tokens"] == 0
-        del verify_idx
+        assert verify_idx == num_verify_requests
 
         in_val_start_pos = torch.from_numpy(in_val_start_pos).to(device=device)
         in_idx_start_pos = torch.from_numpy(in_idx_start_pos).to(device=device)

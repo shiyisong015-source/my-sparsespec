@@ -28,7 +28,11 @@ def main():
     p.add_argument('--max-mem-gib', type=float, default=26)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--disable-timing', action='store_true')
+    p.add_argument('--async-cpu', action='store_true',
+                   help='Enable CPU/GPU overlap; requires --disable-timing')
     args = p.parse_args()
+    if args.async_cpu and not args.disable_timing:
+        p.error('--async-cpu requires --disable-timing: step timing only supports synchronous execution')
     if not (1<=args.k<=14 and 0<args.r<=1 and args.batch>0 and args.output_tokens>0):
         p.error('Expected k in [1,14], r in (0,1], positive batch and output length')
     args.output.mkdir(parents=True, exist_ok=True)
@@ -58,7 +62,7 @@ def main():
                      'source':row.get('source','provided'),'input_tokens':len(ids)})
     cfg={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
     cfg.update(sample_sha256=hashlib.sha256(args.request_file.read_bytes()).hexdigest(),
-               enable_thinking=False,cuda_graph=False,async_cpu=False,inputs=meta,
+               enable_thinking=False,cuda_graph=False,async_cpu=args.async_cpu,inputs=meta,
                cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
                git_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip(),
                git_diff_sha256=hashlib.sha256(subprocess.check_output(['git','diff','HEAD'],cwd=REPO)).hexdigest(),
@@ -68,7 +72,7 @@ def main():
     (args.output/'config.json').write_text(json.dumps(cfg,indent=2))
     start=time.perf_counter()
     outputs=run_inference(reqs=reqs,model_name=args.model,max_batch_size=args.batch,tp_ranks=1,
-        max_mem_per_rank=args.max_mem_gib,cuda_graph=False,async_cpu=False,dtype='bfloat16',
+        max_mem_per_rank=args.max_mem_gib,cuda_graph=False,async_cpu=args.async_cpu,dtype='bfloat16',
         kv_cache='pillar' if args.mode=='sparse' else 'full',admit_policy='offloading',batch_policy='greedy',
         chunk_size=args.chunk_size,clip_length=args.max_model_len,spec_stride=args.k,budget_ratio=args.r,
         num_min_budget=16,temperature=args.temperature,seed=args.seed,dataset_name='qwen3-v2-fixed-sample',

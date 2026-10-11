@@ -1,5 +1,6 @@
 import argparse
 import copy
+import hashlib
 import json
 import os
 import random
@@ -20,10 +21,7 @@ from tqdm import tqdm
 from trajectory import *
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils import construct_prompt, load_jsonl, save_jsonl, set_seed
-from vllm import LLM, SamplingParams
 
-from serve.request.request import Request
-from serve.run import run_inference
 from serve.utils import WandbLogger, is_first_rank
 
 
@@ -69,6 +67,10 @@ def parse_args():
         "--use_specgen", action="store_true", help="Use specgen inference"
     )
     parser.add_argument("--save_outputs", action="store_true")
+    parser.add_argument("--specgen_isolated_epochs", action="store_true",
+                        help="Run each SparseSpec generation call in a fresh TP process group.")
+    parser.add_argument("--specgen_resume_dir", default=None,
+                        help="Validated saved engine directory for replaying completed epoch 0.")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--use_safetensors", action="store_true")
     parser.add_argument("--num_shots", type=int, default=0)
@@ -319,6 +321,9 @@ def parse_args():
     )
 
     # vLLM memory and performance arguments
+    parser.add_argument("--vllm_dtype", default=None, choices=["auto", "float16", "bfloat16", "float32"])
+    parser.add_argument("--vllm_seed", default=None, type=int)
+    parser.add_argument("--vllm_result_dir", default=None, type=str)
     parser.add_argument(
         "--vllm_gpu_memory_utilization",
         type=float,
@@ -531,6 +536,8 @@ def prepare_data(data_name, args):
 
 
 def setup(args):
+    if args.use_vllm:
+        from vllm import LLM
     # load model
     if args.use_specgen:
         # For specgen, we don't need to load model here as run_inference handles it
@@ -584,6 +591,10 @@ def setup(args):
                 "gpu_memory_utilization": args.vllm_gpu_memory_utilization,
                 "max_num_seqs": args.vllm_max_num_seqs,
             }
+            if args.vllm_dtype is not None:
+                vllm_kwargs["dtype"] = args.vllm_dtype
+            if args.vllm_seed is not None:
+                vllm_kwargs["seed"] = args.vllm_seed
 
             # Add optional memory parameters
             if args.vllm_max_model_len is not None:
@@ -778,6 +789,20 @@ def setup(args):
                 print(f"Enabled vLLM stat logging for metrics collection")
 
             llm = LLM(**vllm_kwargs)
+            if args.vllm_result_dir:
+                os.makedirs(args.vllm_result_dir, exist_ok=True)
+                cfg = llm.llm_engine.vllm_config
+                fields = {
+                    "model_config": ["dtype", "max_model_len", "seed"],
+                    "scheduler_config": ["max_num_seqs", "max_num_batched_tokens", "enable_chunked_prefill", "async_scheduling"],
+                    "cache_config": ["gpu_memory_utilization", "block_size", "cache_dtype", "enable_prefix_caching", "num_gpu_blocks"],
+                    "compilation_config": ["cudagraph_mode", "cudagraph_capture_sizes"],
+                }
+                effective = {section: {key: getattr(getattr(cfg, section), key, None) for key in keys}
+                             for section, keys in fields.items()}
+                effective.update(engine_class=type(llm.llm_engine).__module__, engine_kwargs=vllm_kwargs)
+                with open(os.path.join(args.vllm_result_dir, "effective_config.json"), "w") as f:
+                    json.dump(effective, f, indent=2, default=str)
             tokenizer = None
             if args.apply_chat_template:
                 tokenizer = AutoTokenizer.from_pretrained(
@@ -796,6 +821,9 @@ def setup(args):
     results = []
     for data_name in data_list:
         results.append(main(llm, tokenizer, data_name, args))
+
+    if args.use_specgen and not is_first_rank():
+        return
 
     # add "avg" result to data_list and results
     data_list.append("avg")
@@ -853,6 +881,8 @@ def is_multi_choice(answer):
 
 
 def main(llm, tokenizer, data_name, args):
+    if args.use_vllm:
+        from vllm import SamplingParams
     examples, processed_samples, out_file = prepare_data(data_name, args)
     print("=" * 50)
     print("data:", data_name, " ,remain samples:", len(examples))
@@ -978,6 +1008,24 @@ def main(llm, tokenizer, data_name, args):
     remain_prompts = input_prompts
     remain_prompts = [(i, prompt) for i, prompt in enumerate(remain_prompts)]
     end_prompts = []
+    audit_dir = args.vllm_result_dir if args.use_vllm else (args.specgen_result_dir if args.use_specgen else None)
+    if audit_dir and is_first_rank():
+        os.makedirs(audit_dir, exist_ok=True)
+        audit_tokenizer = tokenizer or AutoTokenizer.from_pretrained(args.model_name_or_path)
+        ids = [audit_tokenizer.encode(prompt, add_special_tokens=False) for prompt in input_prompts]
+        workload = dict(dataset=data_name, num_requests=len(input_prompts),
+                        repeat_dataset=args.repeat_dataset, enable_thinking=args.enable_thinking,
+                        prompt_sha256=hashlib.sha256(json.dumps(input_prompts, ensure_ascii=False).encode()).hexdigest(),
+                        token_ids_sha256=hashlib.sha256(json.dumps(ids).encode()).hexdigest(),
+                        input_tokens=sum(map(len, ids)), input_lengths=list(map(len, ids)))
+        if args.specgen_resume_dir:
+            with open(os.path.join(args.specgen_resume_dir, "workload.json")) as f:
+                saved_workload = json.load(f)
+            if saved_workload != workload:
+                raise ValueError("Saved generation workload does not match the current request set")
+        with open(os.path.join(audit_dir, "workload.json"), "w") as f:
+            json.dump(workload, f, indent=2)
+        del ids
 
     max_func_call = 1 if args.prompt_type in ["cot", "pal"] else 4
 
@@ -1009,6 +1057,8 @@ def main(llm, tokenizer, data_name, args):
     # measure time use
     start_time = time.time()
     engine_time_s = 0.0  # measure only engine generation time for fair comparison
+    vllm_request_records = []
+    sparse_epoch_records = []
     for epoch in range(max_func_call):
         print("-" * 20, "Epoch", epoch)
         current_prompts = remain_prompts
@@ -1033,25 +1083,35 @@ def main(llm, tokenizer, data_name, args):
 
             # Sort by request_id and accumulate token counts from vLLM outputs
             vllm_outputs = sorted(vllm_outputs, key=lambda x: int(x.request_id))
-            for out in vllm_outputs:
+            for output_index, out in enumerate(vllm_outputs):
                 total_input_tokens += len(getattr(out, "prompt_token_ids", []))
                 total_output_tokens += len(getattr(out.outputs[0], "token_ids", []))
+                if args.vllm_result_dir:
+                    vllm_request_records.append(dict(
+                        id=int(out.request_id), epoch=epoch, sample_id=current_prompts[output_index][0],
+                        len_input=len(out.prompt_token_ids), len_output=len(out.outputs[0].token_ids),
+                        output_token_ids=list(out.outputs[0].token_ids),
+                        generated_tokens=out.outputs[0].text, finish_reason=out.outputs[0].finish_reason))
             outputs = [out.outputs[0].text for out in vllm_outputs]
         elif args.use_specgen:
             # Convert prompts to Request objects
-            from transformers import AutoTokenizer
-
+            if not args.specgen_isolated_epochs:
+                from serve.request.request import Request
+                from serve.run import run_inference
             specgen_tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
             requests = []
+            token_id_lists = []
             for prompt in prompts:
                 # Tokenize the prompt
                 token_ids = specgen_tokenizer(prompt, return_tensors="pt")["input_ids"][
                     0
                 ].tolist()
                 # Create Request object; max_tokens_per_call controls desired generation length
-                req = Request(token_ids, args.max_tokens_per_call)
-                requests.append(req)
+                token_id_lists.append(token_ids)
+                if not args.specgen_isolated_epochs:
+                    req = Request(token_ids, args.max_tokens_per_call)
+                    requests.append(req)
 
             # Automatically adjust admit_policy if using sparse kv_cache (mirror serve/run.py)
             specgen_admit_policy = args.specgen_admit_policy
@@ -1065,9 +1125,11 @@ def main(llm, tokenizer, data_name, args):
                 )
 
             # Call our custom inference function
+            sparse_epoch_dir = None
+            if args.specgen_result_dir:
+                sparse_epoch_dir = args.specgen_result_dir if epoch == 0 else os.path.join(args.specgen_result_dir, f"epoch-{epoch}")
             time_engine_phase_start = time.time()
-            inference_outputs = run_inference(
-                reqs=requests,
+            inference_kwargs = dict(
                 model_name=args.model_name_or_path,
                 max_batch_size=args.specgen_max_batch_size,
                 tp_ranks=args.specgen_tp_ranks,
@@ -1090,12 +1152,32 @@ def main(llm, tokenizer, data_name, args):
                 perf_sim=args.specgen_perf_sim,
                 gemm_profile_path=args.specgen_gemm_profile_path,
                 debug=args.specgen_debug,
-                result_dir=args.specgen_result_dir,
+                # Only rank 0 saves engine files. Other ranks still need the
+                # returned outputs to keep later generation epochs aligned.
+                result_dir=sparse_epoch_dir if is_first_rank() else None,
                 vanilla_attn=args.specgen_vanilla_attn,
                 dataset_name=data_name,
                 enable_torch_profiler=args.specgen_enable_torch_profiler,
             )
-            engine_time_s += time.time() - time_engine_phase_start
+            if args.specgen_isolated_epochs:
+                from experiments.reproduction.sparse_epochs import run_epoch
+                inference_outputs, epoch_metrics = run_epoch(
+                    token_id_lists, args.max_tokens_per_call, inference_kwargs,
+                    allow_cached=bool(args.specgen_resume_dir) and epoch == 0,
+                )
+                engine_time_s += epoch_metrics["time (s)"]
+                from serve.utils import wandb_logger
+                for name, label in [("spec/accepted_speculative_tokens", "Accepted Speculative Tokens"),
+                                    ("spec/total_speculative_tokens", "Total Speculative Tokens")]:
+                    wandb_logger.log_data.merge({name: epoch_metrics.get(label, 0)}, op="sum")
+            else:
+                inference_outputs = run_inference(reqs=requests, **inference_kwargs)
+                engine_time_s += time.time() - time_engine_phase_start
+            if sparse_epoch_dir and is_first_rank():
+                sparse_epoch_records.append(dict(epoch=epoch, result_dir=sparse_epoch_dir,
+                                                sample_ids=[item[0] for item in current_prompts],
+                                                finished_requests=len(inference_outputs),
+                                                counters_cumulative=not args.specgen_isolated_epochs))
 
             # Capture speculative decoding acceptance rate statistics
             if args.specgen_kv_cache != "full":
@@ -1262,6 +1344,25 @@ def main(llm, tokenizer, data_name, args):
             if epoch == max_func_call - 1:
                 query += "\nReach max function call limit."
             remain_prompts[k] = (i, query)
+
+    # All ranks finished the same generation epochs. Rank 0 alone evaluates
+    # and writes files, avoiding duplicate metrics and concurrent file writes.
+    if args.use_specgen and not is_first_rank():
+        return {"acc": 0.0}
+
+    if args.use_specgen and args.specgen_result_dir:
+        with open(os.path.join(args.specgen_result_dir, "epoch_index.json"), "w") as f:
+            json.dump(sparse_epoch_records, f, indent=2)
+
+    if args.use_vllm and args.vllm_result_dir:
+        with open(os.path.join(args.vllm_result_dir, "requests.json"), "w") as f:
+            json.dump(vllm_request_records, f, ensure_ascii=False)
+        with open(os.path.join(args.vllm_result_dir, "summary.json"), "w") as f:
+            json.dump(dict(engine_seconds=engine_time_s, generation_requests=len(vllm_request_records),
+                           finished_requests=len(set(record['sample_id'] for record in vllm_request_records)),
+                           input_tokens=total_input_tokens, output_tokens=total_output_tokens,
+                           output_tps=total_output_tokens / engine_time_s if engine_time_s else None,
+                           temperature=args.temperature, top_p=args.top_p), f, indent=2)
 
     # unsolved samples
     print("Unsolved samples:", len(remain_prompts))

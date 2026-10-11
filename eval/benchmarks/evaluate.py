@@ -1,4 +1,5 @@
 import argparse
+import multiprocessing
 from concurrent.futures import TimeoutError
 from parser import *
 
@@ -62,7 +63,8 @@ def evaluate(
     scores = []
     timeout_cnt = 0
 
-    with ProcessPool(max_workers=1) as pool:
+    # Never fork a process containing CUDA/NCCL objects into CPU grading.
+    with ProcessPool(max_workers=1, context=multiprocessing.get_context("spawn")) as pool:
         future = pool.map(math_equal_process, params, timeout=3)
         iterator = future.result()
         with tqdm(total=len(samples), desc="Evaluate") as progress_bar:
@@ -77,8 +79,7 @@ def evaluate(
                     scores.append(False)
                     timeout_cnt += 1
                 except Exception as error:
-                    print(error.traceback)
-                    exit()
+                    raise RuntimeError(f"Answer grading worker failed: {error}") from error
                 progress_bar.update(1)
 
     idx = 0

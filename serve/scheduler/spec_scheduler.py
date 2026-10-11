@@ -657,6 +657,13 @@ class SpecScheduler(BaseScheduler):
         nvtx.range_pop()
 
         # Final step: update the selected indices for all requests at once
+        # Completed requests retired their cache buffers above. Their metadata
+        # contains raw GPU pointers and must not reach the selection kernel.
+        remaining_ids = {request.request_id for request in remaining_requests}
+        selected_indices_metadatas = [
+            metadata for metadata in selected_indices_metadatas
+            if self.active_requests[metadata["idx"]].request_id in remaining_ids
+        ]
         nvtx.range_push("Update selected indices")
         with self.step_trace.stage("kv_selection", gpu=True):
             self.spec_cache_class.dispatch_update_selected_indices(

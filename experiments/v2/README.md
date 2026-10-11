@@ -44,6 +44,10 @@ python external/SparseSpec/experiments/v2/run_case.py \
 `--mode ar` uses the full-KV BaseScheduler; it is not r=1 self-speculation.
 `--disable-timing` provides a control for instrumentation overhead. `--seed`,
 `--chunk-size`, `--output-tokens`, and `--max-mem-gib` are explicit controls.
+`--async-cpu --disable-timing` enables the existing asynchronous scheduler for
+either sparse or AR runs. Asynchronous cases retain engine elapsed time and
+request outputs (plus acceptance rounds for sparse), without step timing.
+For an async ablation, disable step timing in the synchronous controls too.
 A completed output directory is never silently overwritten. The case report
 records GPU inventory, visible devices, Git commit/diff and source-file hashes.
 
