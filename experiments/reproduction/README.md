@@ -53,3 +53,46 @@ python external/SparseSpec/experiments/reproduction/analyze_results.py \
 `recovery/`首次接续时，其他用户的作业在空闲检查后开始占用GPU3–6。只停止了我们的冲突任务，保存 `external-contention-interruption.json`，未操作外部进程。OlympiadBench评分已完成并复用到 `recovery2/`；剩余任务仅使用持续空闲至少60秒的GPU对，避免在其他作业重启的短暂空窗中抢占设备。
 
 完成请求稀疏指针生命周期修复及两个CPU回归测试见 `serve/scheduler/spec_scheduler.py`、`serve/request/kv_cache_ptr/pillar.py`、`serve/tests/test_selection_completion.py`。完整经过与失败记录见 `log/reproduction/config_zh.md`。
+
+## 单次生成的 r 扫描与资源诊断（2026-10-11）
+
+本轮固定 Qwen3-8B、TP2、k8、batch 上限128、温度0.6、thinking、graph、异步 CPU 调度，扫描 r=.05/.10/.15。最大总上下文统一32768，以满足 r=.15 的单请求选择 buffer 上限。AIME24使用30条，OlympiadBench和LiveCodeBench分别固定随机抽256条，seed330；每个原始样本在每个配置中只生成一次。同一数据集三个 r 使用相同输入 token 和顺序。保留 EOS 或长度上限终止，无判分、工具反馈或追加生成。
+
+| 文件 | 作用 |
+| --- | --- |
+| `prepare_resource_inputs.py` | 按官方提示词和 tokenizer 制作固定输入，核对已有完整负载哈希，拒绝重复样本 |
+| `run_resource_case.py` | CPU 启动器写一个 payload，torchrun 启动两个新 worker；保存来源、原始结果和完成原因 |
+| `resource_observer.py` | 采样请求状态、KV 占用、CUDA 分配量及 KV 传输事件；同步两张卡的 nsys 窗口 |
+| `selection_probe.py` | 在独立诊断中异步复制实际选择索引，保存物理页到逻辑 token 的映射 |
+| `footprint_stats.py` | 计算按 token、layer、head 保留时的选择并集和可释放字节 |
+| `analyze_resource_cases.py` | 画接受长度分布，区分首次全上下文轮与后续稀疏轮，比较相同负载的吞吐 |
+| `analyze_nsys_resources.py` | 关联 NVTX/CUDA API/DMA，统计计算和 KV 传输的时间并集及重叠 |
+| `analyze_footprints.py` | 合并同一请求同一步的 TP2 快照，画不同粒度的潜在可释放比例 |
+| `run_resource_pipeline.py` | 先完成一组完整 LCB，再扩展九组扫描，最后单独执行 nsys 和选择快照 |
+
+在 SparseSpec 目录执行（必须先激活工作区的复现环境）：
+
+```bash
+source /data/users/songshiyi/vericache/scripts/activate_reproduction.sh
+python experiments/reproduction/run_resource_pipeline.py \
+  --inputs log/reproduction/resource-motivation/inputs-distinct-seed330 \
+  --output log/reproduction/resource-motivation/r-scan-distinct-seed330 \
+  --nsys log/reproduction/resource-motivation/tools/nsys-cli/opt/nvidia/nsight-systems-cli/2026.5.1/bin/nsys \
+  --preflights log/reproduction/resource-motivation/preflight-r015-observer \
+    log/reproduction/resource-motivation/preflight-r015-selection \
+    log/reproduction/resource-motivation/preflight-r015-nsys-aligned \
+    log/reproduction/resource-motivation/preflight-counter-eos \
+    log/reproduction/resource-motivation/calibration-gpu23 \
+    log/reproduction/resource-motivation/calibration-gpu45 \
+    log/reproduction/resource-motivation/calibration-gpu67
+```
+
+输出目录必须尚不存在。只使用持续空闲60秒的 GPU 对，轮换配置；失败保留并停止后续启动，不隐式降低参数。进度在 `pipeline-status.json`，每组运行日志在 `runtime.log`；主分析在 `analysis/`，快照分析在 `footprint-analysis/`。逐文件改动记录在 `log/reproduction/resource-motivation/code-review-2026-10-11/`。
+
+### 测量边界
+
+- 普通吞吐扫描没有新增逐步 CUDA 同步。nsys 的窗口边界会等待两张卡，并调用 profiler API；窗口统计排除这些启动/停止开销，整个诊断运行的吞吐不参与排名。
+- 选择快照的 D2H 有开销，因此另跑。三种可释放比例是假设相应粒度存储后的空间上界；当前实现仍保留整页，不把不同时间的请求快照相加成批级收益。
+- 传输事件的 CPU 提交时间不等于 DMA 耗时。DMA 字节统计包含与窗口交叠的完整复制事件，不按边界裁剪字节。
+- kernel 时间包括模型计算、采样、TP 通信和 KV 准备，不等于 SM 利用率。当前权限不足以采集 SM/Tensor/HBM 硬件计数；缺失的高压窗口在 observer 中显式保存。
+- 随机采样不保证逐 token 相同；短预检仅排查大幅测量开销与 GPU 差异，不提供正式置信区间。原调度器按 verify 轮完成长度检查，实际输出可能略超过配置上限，审计文件保存超出数量。
