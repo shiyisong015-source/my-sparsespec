@@ -56,12 +56,17 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Adopt saved cases after the old CPU controller exits")
     parser.add_argument("--skip-full-case-gate", action="store_true", help="Expand after preflights, before the first full case finishes")
     parser.add_argument("--max-parallel-jobs", type=int, choices=range(1, 5), default=4)
+    parser.add_argument("--selection-limit", type=int, help="Use the same input prefix for every selection ratio")
+    parser.add_argument("--selection-first", action="store_true", help="Prioritize pending selection diagnostics over scans")
+    parser.add_argument("--skip-nsys", action="store_true", help="Defer unstarted nsys cases to a later experiment")
     args = parser.parse_args()
     output = args.output.resolve()
     if not output.is_relative_to(REPO / "log") or (output.exists() and not args.resume):
         parser.error("Use a new pipeline directory under SparseSpec/log, or explicitly --resume")
     if not args.nsys.is_file() or args.idle_grace_seconds < 0:
         parser.error("Invalid nsys path/idle grace")
+    if args.selection_limit is not None and args.selection_limit < 1:
+        parser.error("Selection limit must be positive")
     for preflight in args.preflights:
         report = json.loads((preflight / "launch.json").read_text())
         if report["state"] != "complete":
@@ -73,8 +78,9 @@ def main():
              for dataset in ["aime24", "olympiadbench", "livecodebench"] for ratio in ratios
              if (dataset, ratio) != (first["dataset"], first["ratio"])]
     random.Random(330).shuffle(scans)
+    diagnostic_kinds = ["selection"] if args.skip_nsys else ["nsys", "selection"]
     diagnostics = [dict(dataset="livecodebench", ratio=ratio, kind=kind)
-                   for kind in ["nsys", "selection"] for ratio in ratios]
+                   for kind in diagnostic_kinds for ratio in ratios]
     pending, active, completed, failed = [first] + scans + diagnostics, {}, [], []
     free_since = {}
     pair_cursor = 2
@@ -85,6 +91,7 @@ def main():
         return f"{job['kind']}-{job['dataset']}-r{job['ratio']:.2f}"
 
     resumed_controller_pid = None
+    deferred_nsys = []
     if args.resume:
         previous = json.loads(status_path.read_text())
         if process_running(previous["pid"]):
@@ -93,6 +100,17 @@ def main():
             parser.error("Failed cases require review before resuming")
         if previous["preflights"] != [str(path.resolve()) for path in args.preflights]:
             parser.error("Resume must retain the same preflights")
+        started_selections = [name for name in previous["completed"] + list(previous["active"])
+                              if name.startswith("selection-")]
+        if started_selections and previous.get("selection_limit") != args.selection_limit:
+            parser.error("Resume must retain the request limit of started selection cases")
+        deferred_nsys = list(previous.get("deferred_nsys", []))
+        if args.skip_nsys:
+            if any(name.startswith("nsys-") for name in previous["completed"] + list(previous["active"])):
+                parser.error("Only unstarted nsys cases may be deferred")
+            deferred_nsys = sorted(set(deferred_nsys + [name for name in previous["pending"]
+                                                       if name.startswith("nsys-")]))
+            previous["pending"] = [name for name in previous["pending"] if not name.startswith("nsys-")]
         jobs = {key(job): job for job in pending}
         saved_names = previous["pending"] + previous["completed"] + list(previous["active"])
         if len(saved_names) != len(jobs) or set(saved_names) != set(jobs):
@@ -107,6 +125,9 @@ def main():
                                 process=AttachedCase(saved["pid"], directory, saved["command"]))
         resumed_controller_pid = previous["pid"]
 
+    if args.selection_first:
+        pending.sort(key=lambda job: job["kind"] != "selection")
+
     def save(state, error=None):
         report = dict(state=state, pid=os.getpid(), completed=completed, failed=failed,
                       pending=[key(job) for job in pending],
@@ -114,6 +135,9 @@ def main():
                                      if k not in {"process", "log"}} for name, item in active.items()},
                       idle_grace_seconds=args.idle_grace_seconds,
                       max_parallel_jobs=args.max_parallel_jobs,
+                      selection_limit=args.selection_limit,
+                      selection_first=args.selection_first,
+                      skip_nsys=args.skip_nsys, deferred_nsys=deferred_nsys,
                       skip_full_case_gate=args.skip_full_case_gate,
                       resumed_controller_pid=resumed_controller_pid,
                       initial_full_case=key(first), preflights=[str(path.resolve()) for path in args.preflights])
@@ -172,8 +196,10 @@ def main():
                     break
                 if pending[0]["kind"] == "nsys" and active:
                     break
-                # Complete unprofiled scans before running the diagnostic workload again.
-                if pending[0]["kind"] != "scan" and any(item["kind"] == "scan" for item in active.values()):
+                # Complete scans before selection diagnostics; nsys remains isolated above.
+                if pending[0]["kind"] == "selection" and any(
+                    item["kind"] == "scan" for item in active.values()
+                ):
                     break
                 job = pending.pop(0)
                 name = key(job)
@@ -184,6 +210,8 @@ def main():
                     command += ["--nsys", str(args.nsys.resolve()), "--capture-kind", "both"]
                 elif job["kind"] == "selection":
                     command += ["--selection-probe"]
+                    if args.selection_limit is not None:
+                        command += ["--limit", str(args.selection_limit)]
                 log = (output / f"{name}-controller.log").open("w")
                 process = subprocess.Popen(command, cwd=REPO, stdout=log, stderr=subprocess.STDOUT,
                                            start_new_session=True)

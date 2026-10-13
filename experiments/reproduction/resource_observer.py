@@ -10,6 +10,7 @@ def scheduler_class(base_scheduler, output, rank, settings):
 
     class ResourceObservedScheduler(base_scheduler):
         def __init__(self, *args, **kwargs):
+            #output实验输出目录； rank当前tp进程编号；settings采样间隔，nsys窗口等配置
             super().__init__(*args, **kwargs)
             directory = Path(output)
             self._resource_log = (directory / f"resources.rank{rank}.jsonl").open("w", buffering=1024 * 1024)
@@ -23,6 +24,7 @@ def scheduler_class(base_scheduler, output, rank, settings):
             self._transfer_bytes = {"D2H": 0, "H2D": 0}
             physical = self.kv_pool._physical_mem_gpu
             self._page_bytes = (physical.numel() // self.kv_pool.capacity) * physical.element_size()
+            # 包装函数工厂与包装器思路相同
             self._original_transfers = {"offload": self.kv_pool.offload, "restore": self.kv_pool.restore}
             self.kv_pool.offload = self._transfer_wrapper("offload", "D2H")
             self.kv_pool.restore = self._transfer_wrapper("restore", "H2D")
@@ -52,6 +54,7 @@ def scheduler_class(base_scheduler, output, rank, settings):
                 label = f"resource.kv_{direction} seq={sequence} pages={pages} bytes={byte_count}"
                 started = time.perf_counter()
                 torch.cuda.nvtx.range_push(label)
+                # 会先得到返回值，再执行finally，最后返回给调用者
                 try:
                     return original(first, second)
                 finally:
@@ -65,9 +68,10 @@ def scheduler_class(base_scheduler, output, rank, settings):
 
         def admit_requests(self, pending_requests):
             result = super().admit_requests(pending_requests)
+            #在run（）刚进入，尚未准入请求时，pending_requests就包含这组负载的全部请求
             self._pending_count = len(pending_requests)
             return result
-
+        #计数补齐让_committed_tokens包含首token，最终能与保存的输出总数对上，completed是本轮完成的请求列表
         def update_requests(self, *args, **kwargs):
             normal_before = [(request, request.len_token_ids) for request in self.active_requests
                              if request.status.name == "NORMAL"]
@@ -77,7 +81,7 @@ def scheduler_class(base_scheduler, output, rank, settings):
                     self._committed_tokens += max(0, request.len_token_ids - previous_length)
             self._completed_count += len(completed)
             return completed
-
+        #_committed_token表示所有请求最终保留的输出token数之和，如果只是正确性检测可以删除
         def verify_outputs(self, request, output_token_ids, **kwargs):
             result = super().verify_outputs(request, output_token_ids, **kwargs)
             self._committed_tokens += len(output_token_ids)
@@ -88,13 +92,17 @@ def scheduler_class(base_scheduler, output, rank, settings):
             complete = super().is_request_complete(request, check_idx)
             self._committed_tokens -= previous_length - request.len_token_ids
             return complete
-
+        # 统计活跃队列各状态（normal，draft，verify,stall）各有多少请求；统计活跃请求kv大小
         def _state(self, metadata):
             counts = Counter(request.status.name for request in self.active_requests)
             active_kv = sum(request.len_kv_cache for request in self.active_requests)
+            # kv池总容量
             capacity = self.kv_pool.capacity * self.kv_pool.page_size
+            #空闲页*每页能存多少个token
             free = self.kv_pool.num_free_pages * self.kv_pool.page_size
+            # 卸载队列中的请求还占着多少GPU KV槽位
             gpu_tokens_offloaded_requests = sum(request.len_kv_cache for request in self.offload_requests)
+            # 采样事件，请求数量，kv状态，CPU kv统计
             return dict(step=self.step_id, rank=rank, perf_counter=time.perf_counter(),
                         wall_time=time.time(), elapsed=time.perf_counter() - self._observer_started,
                         active_requests=len(self.active_requests), pending_requests=self._pending_count,
@@ -105,10 +113,13 @@ def scheduler_class(base_scheduler, output, rank, settings):
                         active_kv_ratio=active_kv / capacity,
                         gpu_tokens_offloaded_requests=gpu_tokens_offloaded_requests,
                         cpu_pages_used=self.kv_pool._MAX_CPU_CAPACITY - len(self.kv_pool._free_cpu),
+                        #0 or 1
                         normal_prefill_requests=sum(request.status.name == "NORMAL" and
                                                     request.len_kv_cache <= request.len_input
                                                     for request in self.active_requests),
+                        # forward中参与计算的token数
                         query_tokens=len(metadata["token_ids"]) if metadata is not None else 0,
+                        # 非空计算输出
                         forward_calls=self._forward_calls,
                         committed_output_tokens=self._committed_tokens,
                         cuda_allocated_bytes=torch.cuda.memory_allocated(self.model.device),
@@ -151,7 +162,8 @@ def scheduler_class(base_scheduler, output, rank, settings):
             stream_forward.synchronize()
             torch.cuda.current_stream().synchronize()
             self._capture_barrier()
-
+            # 默认目标20秒，但这个检查只在采样时执行，因此实际窗口可能超过20秒。
+# _capture_phase：现在正在采哪个窗口；None表示没有采集。_capture_windows：已经开始过的窗口及其记录。_capture_remaining：还有哪些窗口没采。
         def _capture(self, state):
             if self._capture_phase is None and not self._capture_remaining:
                 return
@@ -187,6 +199,7 @@ def scheduler_class(base_scheduler, output, rank, settings):
                 self._capture_boundary()
                 api_started = time.perf_counter()
                 if rank == 0:
+                    # 开始记录
                     torch.cuda.cudart().cudaProfilerStart()
                 api_seconds = time.perf_counter() - api_started
                 self._capture_barrier()
