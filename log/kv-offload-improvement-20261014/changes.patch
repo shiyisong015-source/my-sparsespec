@@ -1,0 +1,1268 @@
+--- before/serve/attention/README_packed_kv.md
++++ after/serve/attention/README_packed_kv.md
+@@ -33,14 +33,32 @@
+ 
+ `packed_gpu_pool_mib` and `packed_cpu_pool_mib` specify bounded per-rank arenas.
+ Full KV, hot KV and restored KV share the GPU arena. CPU cold histories
+-share the pinned arena. Admission reserves one complete restore/repack peak,
+-including temporary double CPU backing and maximum requested history growth.
++share the pinned arena. Full and temporary restore leases allocate from the
++high end; persistent hot leases allocate from the low end. The scheduler holds
++fixed per-request hot/cold lease capacities derived from bounded output length,
++k and r. Each layer's live KV is compacted into a contiguous tensor view at the
++front of that lease; unused capacity is after the entire tensor, with no gaps
++between its layers. Cold DMA copies live KV, excluding the unused reservation.
++This avoids growing replacements losing access to the prior round's smaller
++free interval. Low-level packing callers can supply `hot_capacity` and
++`cold_capacity`; their defaults reserve only the current tensor size.
++
++Admission covers initial full KV + packed replacement and the later hot KV +
++restored cold + packed replacement, including double CPU backing and maximum
++requested history growth. It credits the full lease retired by the first pack
++when calculating future restore headroom. It does not charge retired full KV
++and its later restored copy at the same time.
+ It may wait for an active request to release full KV before admitting another.
+ Allocation failures are reported; there is no automatic smaller k/r/batch limit.
+-Before restoring a verify group, first-fit simulation checks all cold restores
+-and replacement hot/CPU leases. The feasible ready prefix shares one model
++Before restoring a verify group, simulation uses the same two-end GPU and
++first-fit CPU allocation rules as the arenas, including fixed replacement lease
++sizes. A request with one remaining output token needs no replacement after
++that verify. The feasible ready prefix shares one model
+ forward. This conservatively reserves all replacements even though actual
+ adoption is sequential. A group smaller than the batch limit is recorded.
++Requests not yet ready for verify continue draft/prefill in the same forward.
++Ready requests excluded by the capacity check stay parked until they can verify;
++their draft length is never extended beyond the configured k.
+ 
+ The default GPU arena is at most 4 GiB, subject to the requested total GPU memory
+ budget with 2 GiB kept for transient non-KV allocations. Default pinned CPU
+@@ -56,9 +74,9 @@
+ ## Current execution limits
+ 
+ This first version runs eager synchronous scheduling. Packing/DMA follows the
+-whole model forward and finishes before the next forward. Prefill and draft
+-requests can share a projection/MLP batch. Ready verify requests share a model
+-forward when arena capacity permits. CUDA attention, KV append and score
++whole model forward and finishes before the next forward. Prefill, draft and
++verify requests can share a projection/MLP batch when arena capacity permits.
++CUDA attention, KV append and score
+ rematerialization are batched; the independent torch reference is per request.
+ Query/head tiles and hot/cold chunks share one attention grid. The default
+ chunk planner targets two TBs per SM and bounds KV chunks to 128–2048 tokens.
+@@ -70,10 +88,19 @@
+ not implemented in this entry. Transfers still complete at whole-forward
+ boundaries; there is no inference/transfer overlap in this version.
+ 
++One pinned CPU upload supplies the attention plan's metadata; a second supplies
++RoPE offsets. CPU allocations explicitly specify their device even when the
++model sets PyTorch's default device to CUDA. Plans bind their metadata and buffer
++lifetimes to one compute stream once per forward. Per-layer guards reject stream
++changes, repeated writes and changing query-head geometry. The GPU batch path
++checks Q/K/V geometry for the whole batch; independent reference frames retain
++their per-request tensor checks.
++
+ BF16 batched verification can change a greedy argmax near a numerical tie,
+ including in the dense self-spec control. Validation records exact equality
+-separately from bounded logit differences; TP2 k14 had one such punctuation
+-difference versus AR, reproduced by the dense self-spec control.
++separately from bounded logit differences. Consult each run's `validation.json`
++for its actual result; an earlier implementation's differences are not evidence
++of differences in the current kernels.
+ 
+ Logs include `rounds.jsonl`, `kv-events.rankN.jsonl`, `requests.json`, and
+ `summary.json`. Events record phase, query count, logical offset, hot/cold count,
+@@ -88,13 +115,17 @@
+ CUDA_VISIBLE_DEVICES=0,1 OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 \
+   torchrun --standalone --nproc_per_node=2 \
+   -m serve.tests.validate_packed_serving \
+-  --output log/kv-offload-20261014/validation-tp2
++  --output "log/packed-validation-$(date +%Y%m%d-%H%M%S)"
+ ```
+ 
+ Select free physical GPU IDs. Single-GPU validation uses `python -m` with one
+ visible GPU. Add `--public-entry` to validate the public `run_inference` entry.
+ The tests load Qwen3-8B, compare greedy generation to dense AR, exercise k=14,
+-r=.05/.25, temperature=.65, mixed prefill/draft, arena pressure and long context.
++r=.05/.25, temperature=.65, mixed prefill/draft/verify, arena pressure, 4.8K
++context and 20.4K context in an arena unable to hold two full histories.
++On a 20K argmax mismatch they also run a dense self-spec control and retain
++the first differing logits in `greedy-check.json`. Exact output equality and
++bounded numerical differences are separate statuses with unchanged bounds.
+ 
+ `serve.tests.test_batched_kv_attention` checks FP16/BF16 outputs, LSE and per-head
+ selection scores against dense FP64 references with 20K histories, ragged query
+@@ -103,6 +134,13 @@
+ same-device native SparseSpec, dense self-spec, resident sparse and CPU offload;
+ the thinking default is enabled. Resident control gathers cold into a GPU mirror
+ and restores by D2D, preserving the same sparse math and verify trajectories.
++`--modes original_sparse resident_sparse packed_offload` selects the three
++corresponding timing arms. All arms still use the same model and reservations.
++
++`test_packed_scheduler` also runs a small deterministic model through actual KV
++kernels for 20K input and 512 decoded tokens to regress repeated buffer growth.
++This checks arena liveness, not Qwen throughput. `test_kv_partition` poisons unused
++CPU capacity to verify that it is neither written nor included in restore DMA.
+ 
+ Main implementation files: `full_forward.py` owns dense initial history;
+ `packed_forward.py` owns compact round boundaries; `packed_batch.py` adapts the
+--- before/serve/attention/batched_kv_attention.py
++++ after/serve/attention/batched_kv_attention.py
+@@ -233,16 +233,26 @@
+             partial_rows += nsplit * qn
+             maximum_splits = max(maximum_splits, nsplit)
+             self._borrowed.extend(t for t in (hot, cold, hs, cs) if t is not None)
+-        self.metadata = torch.tensor(rows, dtype=torch.int64, device=self.device)
+-        self.owners = torch.tensor(owners, dtype=torch.int32, device=self.device)
+-        self.jobs = torch.tensor(tasks, dtype=torch.int64, device=self.device)
+-        self.score_jobs = torch.tensor(score_tasks, dtype=torch.int64, device=self.device).reshape(-1, 3)
++        # One pinned upload per forward. Keep the host allocation alive until
++        # the plan retires; all GPU views share the same allocation/lifetime.
++        flat_rows = [x for row in rows for x in row]
++        flat_jobs = [x for row in tasks for x in row]
++        flat_scores = [x for row in score_tasks for x in row]
++        self._host_metadata = torch.tensor(flat_rows + owners + flat_jobs + flat_scores,
++                                          dtype=torch.int64, device="cpu", pin_memory=True)
++        self._metadata_buffer = self._host_metadata.to(self.device, non_blocking=True)
++        a, b, c = len(flat_rows), len(flat_rows) + len(owners), len(flat_rows) + len(owners) + len(flat_jobs)
++        self.metadata = self._metadata_buffer[:a].view(-1, 15)
++        self.owners = self._metadata_buffer[a:b]
++        self.jobs = self._metadata_buffer[b:c].view(-1, 6)
++        self.score_jobs = self._metadata_buffer[c:].view(-1, 3)
+         self.partial = torch.empty((partial_rows, query_heads, self.dim), dtype=torch.float32, device=self.device)
+         self.partial_lse = torch.empty((partial_rows, query_heads), dtype=torch.float32, device=self.device)
+         self.output = torch.empty((self.total, query_heads, self.dim), dtype=self.dtype, device=self.device)
+         self.lse = torch.empty((self.total, query_heads), dtype=torch.float32, device=self.device)
+         self.max_splits, self.score_rows = triton.next_power_of_2(maximum_splits), score_rows
+         self.ready = torch.cuda.current_stream(self.device).record_event()
++        self._compute_stream = None
+         self.stats = dict(chunk_tokens=chunk_tokens, grid_blocks=len(tasks) * self.heads,
+                           score_blocks=len(score_tasks) * self.heads, query_tile=query_tile,
+                           SMs=_hardware(self.device.index), maximum_splits=maximum_splits,
+@@ -251,10 +261,14 @@
+ 
+     def run(self, q, keys, values, layer):
+         current = torch.cuda.current_stream(self.device)
+-        current.wait_event(self.ready)
+-        for t in (self.metadata, self.owners, self.jobs, self.score_jobs, self.partial,
+-                  self.partial_lse, self.output, self.lse, *self._borrowed):
+-            t.record_stream(current)
++        if self._compute_stream is None:
++            current.wait_event(self.ready)
++            for t in (self._metadata_buffer, self.partial, self.partial_lse,
++                      self.output, self.lse, *self._borrowed):
++                t.record_stream(current)
++            self._compute_stream = current
++        elif current != self._compute_stream:
++            raise RuntimeError("All layers of a batched attention plan must share one compute stream")
+         _append_batch[(triton.cdiv(self.total * self.heads * self.dim, 256),)](
+             keys, values, self.metadata, self.owners, layer, self.total, keys.stride(0), values.stride(0),
+             HEADS=self.heads, DIM=self.dim, BLOCK=256, num_warps=4)
+--- before/serve/attention/full_forward.py
++++ after/serve/attention/full_forward.py
+@@ -14,7 +14,7 @@
+ 
+ class FullKVRegion:
+     def __init__(self, pool, *, layers, capacity, heads, dim, dtype):
+-        self._lease = pool.allocate((layers, capacity, 2, 1, heads, dim), dtype)
++        self._lease = pool.allocate((layers, capacity, 2, 1, heads, dim), dtype, from_end=True)
+         self.kv = self._lease.tensor
+         self.device, self.dtype = self.kv.device, dtype
+         self.layers, self.capacity, self.heads, self.dim = layers, capacity, heads, dim
+@@ -75,14 +75,26 @@
+                 or values.shape != keys.shape
+                 or any(t.device != region.device or t.dtype != region.dtype for t in (q, keys, values))):
+             raise ValueError("Full frame Q/K/V geometry mismatch")
+-        if q.device.type == "cuda":
+-            current = torch.cuda.current_stream(q.device)
++        self._prepare_batch_layer(layer, torch.cuda.current_stream(q.device)
++                                  if q.device.type == "cuda" else None)
++
++    def _prepare_batch_layer(self, layer, current):
++        """Use batch-validated Q/K/V geometry while preserving frame guards."""
++        region = self.region
++        if self._finished or self._failed or layer in self._layers_done:
++            raise RuntimeError("Full frame layer is no longer writable")
++        if type(layer) is not int or not 0 <= layer < region.layers:
++            raise ValueError("Invalid layer")
++        if current is not None:
+             if self._compute_stream is not None and current != self._compute_stream:
+                 raise RuntimeError("Full frame layers must share one compute stream")
+             if self._compute_stream is None:
+                 current.wait_event(self._setup_ready)
+                 if region._forward_ready is not None:
+                     current.wait_event(region._forward_ready)
++                for tensor in (region.kv, self.scores):
++                    if tensor is not None:
++                        tensor.record_stream(current)
+             self._compute_stream = current
+         self._writes_started = True
+ 
+@@ -142,7 +154,7 @@
+         return self.region.length
+ 
+     def start_pack(self, *, budget_ratio, min_tokens, tail_capacity, cpu_pool, gpu_pool,
+-                   stream, chunk_pages=1024):
++                   stream, chunk_pages=1024, hot_capacity=None, cold_capacity=None):
+         if not self._accepted or getattr(self, "_replacement", None) is not None:
+             raise RuntimeError("Commit this full verification before packing it once")
+         if (not math.isfinite(budget_ratio) or not 0 < budget_ratio <= 1
+@@ -161,6 +173,7 @@
+             self.region.kv, plan, tail_capacity=tail_capacity,
+             cpu_pool=cpu_pool, gpu_pool=gpu_pool, stream=stream,
+             chunk_pages=chunk_pages, source_ready=self.ready,
++            hot_capacity=hot_capacity, cold_capacity=cold_capacity,
+         )
+         self._replacement = replacement
+         return replacement
+--- before/serve/attention/kv_buffer_pool.py
++++ after/serve/attention/kv_buffer_pool.py
+@@ -71,10 +71,17 @@
+         self._used_bytes = self._peak_bytes = 0
+         self._closed = False
+ 
+-    def allocate(self, shape, dtype):
+-        """Lease a contiguous tensor, or raise MemoryError without a new reservation."""
++    def allocate(self, shape, dtype, *, from_end=False):
++        """Lease contiguous storage; temporary restores can use the opposite end.
++
++        Persistent hot KV uses low addresses. Placing temporary restores at
++        high addresses prevents replacement hot leases from splitting the
++        space that a slightly larger restore will need in the next round.
++        """
+         if self._closed:
+             raise RuntimeError("KV arena is closed")
++        if type(from_end) is not bool:
++            raise ValueError("from_end must be a bool")
+         shape = tuple(shape)
+         if any(type(size) is not int or size < 0 for size in shape):
+             raise ValueError("Tensor dimensions must be nonnegative integers")
+@@ -82,25 +89,30 @@
+         raw_bytes = math.prod(shape) * item_bytes
+         allocated_bytes = (raw_bytes + self.alignment - 1) // self.alignment * self.alignment
+         self.reclaim()
+-        for index, (offset, free_bytes) in enumerate(self._free):
++        if not raw_bytes:
++            lease = BufferLease(self, 0, 0, self._buffer[:0].view(dtype).view(shape))
++            self._leases[id(lease)] = lease
++            return lease
++        indices = range(len(self._free) - 1, -1, -1) if from_end else range(len(self._free))
++        for index in indices:
++            offset, free_bytes = self._free[index]
+             if free_bytes < allocated_bytes:
+                 continue
++            start = ((offset + free_bytes - allocated_bytes) // self.alignment * self.alignment
++                     if from_end else offset)
+             # Construct before changing accounting, so bad views cannot leak space.
+-            tensor = self._buffer[offset:offset + raw_bytes].view(dtype).view(shape)
+-            lease = BufferLease(self, offset, allocated_bytes, tensor)
+-            if allocated_bytes:
+-                if free_bytes == allocated_bytes:
+-                    self._free.pop(index)
+-                else:
+-                    self._free[index] = (offset + allocated_bytes, free_bytes - allocated_bytes)
++            tensor = self._buffer[start:start + raw_bytes].view(dtype).view(shape)
++            lease = BufferLease(self, start, allocated_bytes, tensor)
++            remaining = []
++            if start > offset:
++                remaining.append((offset, start - offset))
++            end = start + allocated_bytes
++            if end < offset + free_bytes:
++                remaining.append((end, offset + free_bytes - end))
++            self._free[index:index + 1] = remaining
+             self._leases[id(lease)] = lease
+             self._used_bytes += allocated_bytes
+             self._peak_bytes = max(self._peak_bytes, self._used_bytes)
+-            return lease
+-        # Empty tensors need no interval, including when the arena is full.
+-        if not raw_bytes:
+-            lease = BufferLease(self, 0, 0, self._buffer[:0].view(dtype).view(shape))
+-            self._leases[id(lease)] = lease
+             return lease
+         raise MemoryError(
+             f"KV arena exhausted on {self.device}: need {allocated_bytes} bytes, "
+@@ -140,6 +152,7 @@
+             reserved_bytes=0 if self._closed else self.capacity_bytes,
+             in_use_bytes=self._used_bytes,
+             free_bytes=self.capacity_bytes - self._used_bytes, peak_bytes=self._peak_bytes,
++            largest_free_bytes=max((size for _, size in self._free), default=0),
+             pending_bytes=sum(lease.allocated_bytes for lease in self._leases.values()
+                               if lease._state == "pending"),
+             active_leases=sum(lease._state == "active" for lease in self._leases.values()),
+--- before/serve/attention/kv_partition.py
++++ after/serve/attention/kv_partition.py
+@@ -1,11 +1,12 @@
+ """Rank-local packed KV and explicit offload/restore phase boundaries.
+ 
+-This component is not yet connected to Request or the serving scheduler.
++The packed scheduler uses this component at whole-forward phase boundaries.
+ Original page ownership remains with its caller until a completed migration
+ is explicitly adopted. No original token IDs are attached to packed KV.
+ """
+ 
+ from dataclasses import dataclass
++import math
+ 
+ import torch
+ 
+@@ -131,7 +132,7 @@
+     def start_offload(
+         cls, source, plan, *, tail_capacity, chunk_pages=1024, source_ready=None,
+         stream=None, num_programs=None, cpu_pool=None, gpu_pool=None,
+-        cold_source=None, source_hot_length=None,
++        cold_source=None, source_hot_length=None, hot_capacity=None, cold_capacity=None,
+     ):
+         """Pack and offload, optionally using explicitly budgeted reusable arenas.
+ 
+@@ -167,6 +168,11 @@
+         if (type(tail_capacity) is not int or tail_capacity < 0
+                 or type(chunk_pages) is not int or chunk_pages < 1):
+             raise ValueError("Invalid tail/transfer capacity")
++        hot_capacity = plan.hot_count + tail_capacity if hot_capacity is None else hot_capacity
++        cold_capacity = plan.cold_count if cold_capacity is None else cold_capacity
++        if (type(hot_capacity) is not int or hot_capacity < plan.hot_count + tail_capacity
++                or type(cold_capacity) is not int or cold_capacity < plan.cold_count):
++            raise ValueError("Reserved KV capacity must cover the live packed tensors")
+         if num_programs is not None and (type(num_programs) is not int or num_programs < 1):
+             raise ValueError("num_programs must be positive")
+         stream = torch.cuda.current_stream(source.device) if stream is None else stream
+@@ -187,6 +193,7 @@
+         region.hot_count, region.cold_count = plan.hot_count, plan.cold_count
+         region.selected_count, region.recent_count = plan.selected_count, plan.recent_count
+         region.tail_capacity, region.tail_length = tail_capacity, 0
++        region.hot_capacity, region.cold_capacity = hot_capacity, cold_capacity
+         region.phase = "offloading"
+         region._gpu_pool = gpu_pool
+         region._leases = {}
+@@ -204,17 +211,24 @@
+             hot=(layers, plan.hot_count + tail_capacity, 2, 1, heads, dim),
+             cold=(layers, plan.cold_count, 2, 1, heads, dim),
+         )
++        reserved_shapes = dict(hot=(layers, hot_capacity, 2, 1, heads, dim),
++                               cold=(layers, cold_capacity, 2, 1, heads, dim))
++        def live_view(tensor, shape):
++            # Slack is after the whole live tensor, not between its layers.
++            # Thus both gather and H2D still operate on contiguous live KV.
++            return tensor.reshape(-1)[:math.prod(shape)].view(shape)
+         region._staging = None  # Direct mapped-host writes need no GPU staging.
+         try:
+             if cpu_pool is None:
+-                region._hot = torch.empty(shapes["hot"], dtype=source.dtype, device=source.device)
+-                region._cold_cpu = torch.empty(shapes["cold"], dtype=source.dtype,
+-                                               device="cpu", pin_memory=True)
++                region._hot = live_view(torch.empty(reserved_shapes["hot"], dtype=source.dtype,
++                                                     device=source.device), shapes["hot"])
++                region._cold_cpu = live_view(torch.empty(reserved_shapes["cold"], dtype=source.dtype,
++                                                         device="cpu", pin_memory=True), shapes["cold"])
+             else:
+                 for name, pool in (("cold", cpu_pool), ("hot", gpu_pool)):
+-                    region._leases[name] = pool.allocate(shapes[name], source.dtype)
+-                region._hot = region._leases["hot"].tensor
+-                region._cold_cpu = region._leases["cold"].tensor
++                    region._leases[name] = pool.allocate(reserved_shapes[name], source.dtype)
++                region._hot = live_view(region._leases["hot"].tensor, shapes["hot"])
++                region._cold_cpu = live_view(region._leases["cold"].tensor, shapes["cold"])
+         except Exception:
+             # Nothing was submitted, so a partial reservation is safe to return.
+             for lease in region._leases.values():
+@@ -253,7 +267,7 @@
+     @classmethod
+     def start_repartition(cls, previous, restored, plan, *, cpu_pool=None, gpu_pool=None,
+                           tail_capacity=None, chunk_pages=1024, stream=None,
+-                          source_ready=None, num_programs=None):
++                          source_ready=None, num_programs=None, hot_capacity=None, cold_capacity=None):
+         """Build next-round hot/cold from compact history plus accepted tail.
+ 
+         The temporary slot space is [previous.hot[:hot_length], restored.cold].
+@@ -276,6 +290,7 @@
+             cpu_pool=cpu_pool, gpu_pool=gpu_pool, chunk_pages=chunk_pages,
+             source_ready=source_ready, stream=stream, num_programs=num_programs,
+             cold_source=restored.kv, source_hot_length=previous.hot_length,
++            hot_capacity=hot_capacity, cold_capacity=cold_capacity,
+         )
+         replacement._previous_region = previous
+         replacement._restored_source = restored
+@@ -409,7 +424,7 @@
+             if self._gpu_pool is None:
+                 destination = torch.empty(shape, dtype=self.dtype, device=self.device)
+             else:
+-                lease = self._gpu_pool.allocate(shape, self.dtype)
++                lease = self._gpu_pool.allocate(shape, self.dtype, from_end=True)
+                 destination = lease.tensor
+         if (destination.ndim != 6 or destination.shape[0] != self.layers
+                 or destination.shape[1] < count
+--- before/serve/attention/packed_batch.py
++++ after/serve/attention/packed_batch.py
+@@ -37,9 +37,12 @@
+         for frame in self.frames:
+             self._offsets.append(self._offsets[-1] + frame.query_tokens)
+         self.num_tokens = self._offsets[-1]
+-        self.qo_indptr = torch.tensor(self._offsets, dtype=torch.int32, device=self.device)
+-        self.position_offsets = torch.tensor([frame.position_start for frame in self.frames],
+-                                             dtype=torch.int32, device=self.device)
++        self._host_rope_metadata = torch.tensor(
++            self._offsets + [frame.position_start for frame in self.frames],
++            dtype=torch.int32, device="cpu", pin_memory=self.device.type == "cuda")
++        self._rope_metadata = self._host_rope_metadata.to(self.device, non_blocking=True)
++        self.qo_indptr = self._rope_metadata[:len(self._offsets)]
++        self.position_offsets = self._rope_metadata[len(self._offsets):]
+         self._rope_fn = rope_fn  # CPU tests can inject an independent position oracle.
+         self._metadata_ready = (torch.cuda.current_stream(self.device).record_event()
+                                 if self.device.type == "cuda" else None)
+@@ -47,6 +50,8 @@
+         self._layers_done = set()
+         self._finished = self._aborted = False
+         self._gpu_attention = None
++        self._compute_stream = None
++        self._query_heads = None
+ 
+     def _require_open(self):
+         if self._finished or self._aborted:
+@@ -63,6 +68,22 @@
+                 or q.shape[1] < 1 or q.shape[1] % self.heads
+                 or q.device != self.device or q.dtype != self.dtype):
+             raise ValueError("Q must match the batched rank-local query geometry")
++        if self._query_heads is None:
++            self._query_heads = q.shape[1]
++        elif q.shape[1] != self._query_heads:
++            raise ValueError("Query head count must remain fixed across model layers")
++
++    def _bind_stream(self):
++        if self.device.type != "cuda":
++            return None
++        current = torch.cuda.current_stream(self.device)
++        if self._compute_stream is None:
++            current.wait_event(self._metadata_ready)
++            self._rope_metadata.record_stream(current)
++            self._compute_stream = current
++        elif current != self._compute_stream:
++            raise RuntimeError("All layers of a packed batch must share one compute stream")
++        return current
+ 
+     def apply_batch_rope(self, q, k, config):
+         """Use each frame's absolute logical offset, preserving existing RoPE settings."""
+@@ -71,11 +92,7 @@
+         self._check_kv(k, k)
+         if getattr(config, "high_freq_factor", None) is not None or getattr(config, "low_freq_factor", None) is not None:
+             raise ValueError("This adapter supports the same basic RoPE settings as KVPool")
+-        if self.device.type == "cuda":
+-            current = torch.cuda.current_stream(self.device)
+-            current.wait_event(self._metadata_ready)
+-            self.qo_indptr.record_stream(current)
+-            self.position_offsets.record_stream(current)
++        self._bind_stream()
+         rope_fn = self._rope_fn
+         if rope_fn is None:
+             if self.device.type != "cuda":
+@@ -114,8 +131,9 @@
+                     raise ValueError("Batched attention requires contiguous head/channel dimensions")
+                 if self._gpu_attention is None:
+                     self._gpu_attention = BatchedKVAttention(self.frames, self._offsets, query_heads=q.shape[1])
+-                for frame, start, end in zip(self.frames, self._offsets[:-1], self._offsets[1:]):
+-                    frame.prepare_layer(layer_idx, q[start:end], keys[start:end], values[start:end])
++                current = self._bind_stream()
++                for frame in self.frames:
++                    frame._prepare_batch_layer(layer_idx, current)
+                 output = self._gpu_attention.run(q, keys, values, layer_idx)
+                 for frame in self.frames:
+                     frame.complete_layer(layer_idx)
+--- before/serve/attention/packed_forward.py
++++ after/serve/attention/packed_forward.py
+@@ -95,8 +95,16 @@
+                 or any(tensor.device != self.region.device or tensor.dtype != self.region.dtype
+                        for tensor in (q, keys, values))):
+             raise ValueError("Query and tail geometry must match the scheduled forward")
+-        if q.device.type == "cuda":
+-            current = torch.cuda.current_stream(q.device)
++        self._prepare_batch_layer(layer, torch.cuda.current_stream(q.device)
++                                  if q.device.type == "cuda" else None)
++
++    def _prepare_batch_layer(self, layer, current):
++        """Use batch-validated Q/K/V geometry while preserving frame guards."""
++        if self._finished or self._failed or layer in self._layers_done:
++            raise RuntimeError("Packed frame layer is no longer writable")
++        if type(layer) is not int or not 0 <= layer < self.region.layers:
++            raise ValueError("Invalid layer")
++        if current is not None:
+             if self._compute_stream is not None and current != self._compute_stream:
+                 raise RuntimeError("All layers of a packed frame must use one compute stream")
+             if self._compute_stream is None:
+@@ -105,10 +113,10 @@
+                     current.wait_event(self._prior_ready)
+                 if self.restored is not None:
+                     current.wait_event(self.restored.ready)
++                for tensor in (self.region.hot_kv, self.hot_scores, self.cold_scores):
++                    if tensor is not None:
++                        tensor.record_stream(current)
+             self._compute_stream = current
+-            for tensor in (self.region.hot_kv, self.hot_scores, self.cold_scores):
+-                if tensor is not None:
+-                    tensor.record_stream(current)
+         self._writes_started = True
+ 
+     def complete_layer(self, layer):
+@@ -236,7 +244,7 @@
+                                recent_count=recent, validate=validate)
+ 
+     def start_repack(self, *, budget_ratio, min_tokens=128, cpu_pool=None, gpu_pool=None,
+-                     stream=None, chunk_pages=1024, validate=False):
++                     stream=None, chunk_pages=1024, validate=False, hot_capacity=None, cold_capacity=None):
+         """Start the local migration after all layers and rejection sampling."""
+         if getattr(self, "_replacement", None) is not None:
+             raise RuntimeError("This verification already started a replacement migration")
+@@ -245,6 +253,7 @@
+         replacement = PackedKVRegion.start_repartition(
+             self.region, self.restored, plan, cpu_pool=cpu_pool, gpu_pool=gpu_pool,
+             stream=stream, chunk_pages=chunk_pages, source_ready=self.ready,
++            hot_capacity=hot_capacity, cold_capacity=cold_capacity,
+         )
+         self._replacement = replacement
+         return replacement
+--- before/serve/scheduler/packed_scheduler.py
++++ after/serve/scheduler/packed_scheduler.py
+@@ -98,7 +98,8 @@
+         self.step = 0
+         self.accepted = self.proposed = 0
+         self.metrics = dict(forwards=0, verify_forwards=0, migrations=0, restores=0,
+-                            admission_waits=0, max_actual_batch=0, mixed_prefill_draft_forwards=0, verify_model_forwards=0,
++                            admission_waits=0, max_actual_batch=0, mixed_prefill_draft_forwards=0,
++                            mixed_verify_draft_forwards=0, mixed_verify_prefill_forwards=0, verify_model_forwards=0,
+                             max_verify_batch=0, verify_batch_histogram={}, d2h_bytes=0, h2d_bytes=0, full_bytes_returned=0)
+         self._events = self._rounds = None
+         if result_dir is not None:
+@@ -132,9 +133,18 @@
+         cold = length - min(length, max(self.minimum, math.ceil(length * self.r), 2))
+         if self.dense_reference or self.retain_full_reference:
+             return (length + 1) * self.token_bytes, 0, 0, 0
+-        base = (hot + self.k + 1 if packed else request.len_input + self.k + 1) * self.token_bytes
+-        extra = (cold + hot + self.k + 1) * self.token_bytes
+-        return base, extra, cold * self.token_bytes, cold * self.token_bytes
++        packed_base = hot + self.k + 1
++        if packed:
++            base, extra = packed_base, cold + packed_base
++        else:
++            # Cover both peaks: initial full KV + its packed replacement, and
++            # later packed KV + restored cold + another packed replacement.
++            # Full -> packed reduces the reserved base by a nonnegative amount;
++            # it must not reserve a future restore on top of the retired full KV.
++            base = max(request.len_input + self.k + 1, packed_base)
++            extra = max(packed_base, cold + 2 * packed_base - base)
++        return (base * self.token_bytes, extra * self.token_bytes,
++                cold * self.token_bytes, cold * self.token_bytes)
+ 
+     def _fits(self, active, request):
+         estimates = [self._estimate(state.request, packed=isinstance(state.region, PackedKVRegion))
+@@ -220,6 +230,10 @@
+             aggregate["workspace_peak_bytes"] = max(aggregate["workspace_peak_bytes"], attention["workspace_bytes"])
+         if "prefill" in phases and "draft" in phases:
+             self.metrics["mixed_prefill_draft_forwards"] += 1
++        if "verify" in phases and "draft" in phases:
++            self.metrics["mixed_verify_draft_forwards"] += 1
++        if "verify" in phases and "prefill" in phases:
++            self.metrics["mixed_verify_prefill_forwards"] += 1
+         self._log("forward", requests=[entry[0].request.request_id for entry in entries],
+                   phases=phases, query_tokens=[len(entry[2]) for entry in entries],
+                   logical_offsets=[entry[1].position_start for entry in entries], attention=attention)
+@@ -329,15 +343,18 @@
+                 state.round_start = state.region.length
+                 return
+             old_bytes = state.region._lease.allocated_bytes if restored is None else 0
++            hot_bytes, _, cold_bytes, _ = self._estimate(state.request, packed=True)
++            capacities = dict(hot_capacity=hot_bytes // self.token_bytes,
++                              cold_capacity=cold_bytes // self.token_bytes)
+             def repack():
+                 if restored is None:
+                     return frame.start_pack(budget_ratio=self.r, min_tokens=self.minimum,
+                                             tail_capacity=self.k + 1, cpu_pool=self.cpu_pool,
+                                             gpu_pool=self.gpu_pool, stream=self.transfer_stream,
+-                                            chunk_pages=self.chunk_pages)
++                                            chunk_pages=self.chunk_pages, **capacities)
+                 return frame.start_repack(budget_ratio=self.r, min_tokens=self.minimum,
+                                          cpu_pool=self.cpu_pool, gpu_pool=self.gpu_pool,
+-                                         stream=self.transfer_stream, chunk_pages=self.chunk_pages)
++                                         stream=self.transfer_stream, chunk_pages=self.chunk_pages, **capacities)
+             replacement = coordinated_call(
+                 self.group, "repack allocation", repack,
+                 lambda region: region.close(consumer_done=region.offload_ready),
+@@ -369,16 +386,22 @@
+         def choose():
+             self.gpu_pool.reclaim()
+             self.cpu_pool.reclaim()
+-            def reserve(intervals, size, alignment):
++            def reserve(intervals, size, alignment, *, from_end=False):
+                 size = (size + alignment - 1) // alignment * alignment
+                 if not size:
+                     return True
+-                for i, (offset, length) in enumerate(intervals):
++                indices = range(len(intervals) - 1, -1, -1) if from_end else range(len(intervals))
++                for i in indices:
++                    offset, length = intervals[i]
+                     if length >= size:
+-                        if length == size:
+-                            intervals.pop(i)
+-                        else:
+-                            intervals[i] = (offset + size, length - size)
++                        start = ((offset + length - size) // alignment * alignment
++                                 if from_end else offset)
++                        remaining = []
++                        if start > offset:
++                            remaining.append((offset, start - offset))
++                        if start + size < offset + length:
++                            remaining.append((start + size, offset + length - start - size))
++                        intervals[i:i + 1] = remaining
+                         return True
+                 return False
+             chosen = 0
+@@ -389,12 +412,10 @@
+                 for state in ready[:count]:
+                     packed = isinstance(state.region, PackedKVRegion)
+                     restore = state.region.cold_count * self.token_bytes if packed else 0
+-                    fits &= reserve(gpu, restore, self.gpu_pool.alignment)
+-                    length = state.round_start + len(state.drafts) + 1
+-                    recent = len(state.drafts) + 2
+-                    hot = min(length, max(self.minimum, math.ceil(length * self.r), recent))
+-                    replacements.append(((hot + self.k + 1) * self.token_bytes,
+-                                         (length - hot) * self.token_bytes))
++                    fits &= reserve(gpu, restore, self.gpu_pool.alignment, from_end=True)
++                    if not self.retain_full_reference and state.request.len_output - len(state.output) > 1:
++                        hot_bytes, _, cold_bytes, _ = self._estimate(state.request, packed=True)
++                        replacements.append((hot_bytes, cold_bytes))
+                 if not self.retain_full_reference:
+                     for hot, cold in replacements:
+                         fits &= reserve(gpu, hot, self.gpu_pool.alignment)
+@@ -411,13 +432,74 @@
+                   requests=[s.request.request_id for s in ready[:count]])
+         return ready[:count]
+ 
++    def _ready_for_verify(self, state):
++        return (bool(state.output) and not self.dense_reference
++                and len(state.drafts) >= min(self.k, state.request.len_output - len(state.output) - 1))
++
++    def _nonverify_entries(self, states):
++        """Prepare non-ready requests without extending any draft beyond k."""
++        if not states:
++            return []
++        entries = []
++        def create_entries():
++            for state in states:
++                if self._ready_for_verify(state):
++                    raise RuntimeError("A ready request must verify before drafting again")
++                if not state.output:
++                    start = state.region.length
++                    ids = state.prompt[start:start + self.chunk_size]
++                    frame = FullForward(state.region, query_tokens=len(ids))
++                    phase = "prefill"
++                else:
++                    ids = [state.drafts[-1] if state.drafts else state.output[-1]]
++                    frame = (PackedForward(state.region, mode="draft", query_tokens=1)
++                             if isinstance(state.region, PackedKVRegion)
++                             else FullForward(state.region, query_tokens=1))
++                    phase = "ar" if self.dense_reference else "draft"
++                entries.append((state, frame, ids, phase))
++            return entries
++        try:
++            return coordinated_call(self.group, "prefill/draft frames", create_entries,
++                                    lambda rows: [frame.abort() for _, frame, _, _ in rows])
++        except Exception:
++            for _, frame, _, _ in entries:
++                if not frame._finished and not frame._aborted:
++                    frame.abort()
++            raise
++
++    def _commit_nonverify(self, entries, sampled, probs, active, completed):
++        offset = 0
++        for state, _, ids, phase in entries:
++            end = offset + len(ids)
++            if phase == "prefill":
++                if state.region.length == state.request.len_input:
++                    _, finished = self._emit(state, [sampled[end - 1]])
++                    state.round_start = state.region.length
++                    if finished:
++                        self._complete(state, active, completed)
++            elif phase == "ar":
++                _, finished = self._emit(state, [sampled[offset]])
++                if finished:
++                    self._complete(state, active, completed)
++            else:
++                state.drafts.append(sampled[offset])
++                if self.rank == 0:
++                    state.draft_probs.append(probs[offset:end].clone())
++            offset = end
++
+     def _verify_many(self, states, active, completed):
+-        prepared = []
++        prepared, others = [], []
+         try:
+             for state in states:
+                 frame, restored, query = self._prepare_verify(state)
+                 prepared.append((state, frame, restored, query))
+-            sampled, probs = self._forward([(s, f, q, "verify") for s, f, _, q in prepared])
++            selected = {id(state) for state in states}
++            # Ready requests excluded by capacity remain parked. Other requests
++            # already own their tail/prefill storage and can compute in the same
++            # model forward without adding a restore or replacement lease.
++            others = self._nonverify_entries([state for state in active
++                                             if id(state) not in selected and not self._ready_for_verify(state)])
++            sampled, probs = self._forward([(s, f, q, "verify") for s, f, _, q in prepared] + others)
+             self.metrics["verify_model_forwards"] += 1
+             self.metrics["max_verify_batch"] = max(self.metrics["max_verify_batch"], len(prepared))
+             histogram = self.metrics["verify_batch_histogram"]
+@@ -428,7 +510,12 @@
+                 self._commit_verify(state, active, completed, frame, restored, sampled[offset:end],
+                                     probs[offset:end] if probs is not None else None)
+                 offset = end
++            self._commit_nonverify(others, sampled[offset:], probs[offset:] if probs is not None else None,
++                                   active, completed)
+         finally:
++            for _, frame, _, _ in others:
++                if not frame._finished and not frame._aborted:
++                    frame.abort()
+             for state, frame, restored, _ in prepared:
+                 if not frame._finished and not frame._aborted:
+                     frame.abort()
+@@ -454,54 +541,13 @@
+                 self._admit(pending, active)
+                 # Restore and verify the largest ready prefix whose complete
+                 # restore/replacement peak fits the explicitly reserved arenas.
+-                ready = [state for state in active if state.output and not self.dense_reference
+-                         and len(state.drafts) >= min(self.k, state.request.len_output - len(state.output) - 1)]
++                ready = [state for state in active if self._ready_for_verify(state)]
+                 if ready:
+                     self._verify_many(self._verify_group(ready), active, completed)
+                     continue
+-                entries = []
+-                def create_entries():
+-                    for state in active:
+-                        if not state.output:
+-                            start = state.region.length
+-                            ids = state.prompt[start:start + self.chunk_size]
+-                            frame = FullForward(state.region, query_tokens=len(ids))
+-                            phase = "prefill"
+-                        else:
+-                            ids = [state.drafts[-1] if state.drafts else state.output[-1]]
+-                            frame = (PackedForward(state.region, mode="draft", query_tokens=1)
+-                                     if isinstance(state.region, PackedKVRegion)
+-                                     else FullForward(state.region, query_tokens=1))
+-                            phase = "ar" if self.dense_reference else "draft"
+-                        entries.append((state, frame, ids, phase))
+-                    return entries
+-                try:
+-                    coordinated_call(self.group, "prefill/draft frames", create_entries,
+-                                     lambda rows: [frame.abort() for _, frame, _, _ in rows])
+-                except Exception:
+-                    for _, frame, _, _ in entries:
+-                        if not frame._finished and not frame._aborted:
+-                            frame.abort()
+-                    raise
++                entries = self._nonverify_entries(active)
+                 sampled, probs = self._forward(entries)
+-                offset = 0
+-                for state, _, ids, phase in entries:
+-                    end = offset + len(ids)
+-                    if phase == "prefill":
+-                        if state.region.length == state.request.len_input:
+-                            _, finished = self._emit(state, [sampled[end - 1]])
+-                            state.round_start = state.region.length
+-                            if finished:
+-                                self._complete(state, active, completed)
+-                    elif phase == "ar":
+-                        _, finished = self._emit(state, [sampled[offset]])
+-                        if finished:
+-                            self._complete(state, active, completed)
+-                    else:
+-                        state.drafts.append(sampled[offset])
+-                        if self.rank == 0:
+-                            state.draft_probs.append(probs[offset:end].clone())
+-                    offset = end
++                self._commit_nonverify(entries, sampled, probs, active, completed)
+                 probs = None
+             torch.cuda.current_stream(self.device).synchronize()
+             self.metrics.update(accepted_draft_tokens=self.accepted, proposed_draft_tokens=self.proposed,
+--- before/serve/tests/bench_aime_kv_overhead.py
++++ after/serve/tests/bench_aime_kv_overhead.py
+@@ -239,6 +239,8 @@
+     parser.add_argument("--minimum", type=int, default=128)
+     parser.add_argument("--chunk-size", type=int, default=256)
+     parser.add_argument("--repetitions", type=int, default=3)
++    parser.add_argument("--modes", nargs="+", choices=("original_sparse", "full_self_spec", "resident_sparse", "packed_offload"),
++                        default=["original_sparse", "full_self_spec", "resident_sparse", "packed_offload"])
+     parser.add_argument("--seed", type=int, default=330)
+     parser.add_argument("--no-thinking", action="store_true")
+     parser.add_argument("--gpu-mib", type=int, default=2048)
+@@ -246,6 +248,8 @@
+     parser.add_argument("--diagnostic-rounds", type=int, default=8)
+     parser.add_argument("--diagnostic-min-history", type=int, default=256)
+     args = parser.parse_args()
++    if args.repetitions < 1 or len(args.modes) != len(set(args.modes)):
++        raise ValueError("Use positive repetitions and distinct benchmark modes")
+     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+         raise ValueError("This cost pilot requires TP1 for a same-device comparison")
+     output = Path(args.output)
+@@ -363,7 +367,7 @@
+             save(output / f"phases-{mode}.json", diagnostic.resolve())
+         return record
+ 
+-    modes = ["original_sparse", "full_self_spec", "resident_sparse", "packed_offload"]
++    modes = args.modes
+     try:
+         for mode in modes:
+             trial(mode, "smoke", 0, min(16, args.output_length))
+@@ -382,17 +386,23 @@
+             tokens_per_second=describe([row["tokens_per_second"] for row in results if row["mode"] == mode]))
+             for mode in modes}
+         for mode in ("resident_sparse", "packed_offload"):
++            if mode not in modes:
++                continue
+             diagnostic = Events(args.diagnostic_rounds, args.diagnostic_min_history)
+             measured = trial(mode, "diagnostic", 0, args.output_length, diagnostic)
+             measured["vs_uninstrumented_median_percent"] = 100 * (
+                 measured["seconds"] / summary[mode]["seconds"]["median"] - 1)
+             save(output / f"diagnostic-overhead-{mode}.json", measured)
+         medians = {mode: summary[mode]["seconds"]["median"] for mode in modes}
+-        summary["comparison"] = dict(
+-            offload_vs_resident_time_percent=100 * (medians["packed_offload"] / medians["resident_sparse"] - 1),
+-            offload_minus_resident_seconds=medians["packed_offload"] - medians["resident_sparse"],
+-            offload_vs_original_time_percent=100 * (medians["packed_offload"] / medians["original_sparse"] - 1),
+-            offload_vs_full_self_spec_time_percent=100 * (medians["packed_offload"] / medians["full_self_spec"] - 1))
++        comparison = {}
++        if "packed_offload" in medians:
++            for baseline, label in (("resident_sparse", "resident"), ("original_sparse", "original"),
++                                    ("full_self_spec", "full_self_spec")):
++                if baseline in medians:
++                    comparison[f"offload_vs_{label}_time_percent"] = 100 * (medians["packed_offload"] / medians[baseline] - 1)
++            if "resident_sparse" in medians:
++                comparison["offload_minus_resident_seconds"] = medians["packed_offload"] - medians["resident_sparse"]
++        summary["comparison"] = comparison
+         save(output / "summary.json", summary)
+         print("BENCHMARK_PASSED", json.dumps(summary), flush=True)
+     finally:
+--- before/serve/tests/test_batched_kv_attention.py
++++ after/serve/tests/test_batched_kv_attention.py
+@@ -16,6 +16,22 @@
+ @unittest.skipUnless(os.environ.get("RUN_PACKED_KV_GPU") == "1" and torch.cuda.is_available(),
+                      "Requires an available CUDA GPU")
+ class BatchedAttentionCudaTest(unittest.TestCase):
++    def test_cuda_default_device_and_stream_change_guard(self):
++        with torch.device("cuda"):
++            frame, q, tail, _, _ = self.packed(133, 1, 4, torch.bfloat16, draft=True)
++            batch = PackedBatch([frame])
++            batch.append_batch_kv_cache(tail[0, :, 0, 0], tail[0, :, 1, 0], 0)
++            output = batch.batch_attn_fwd(q, 0)
++            self.assertTrue(torch.isfinite(output).all())
++            for host in (batch._host_rope_metadata, batch._gpu_attention._host_metadata):
++                self.assertEqual(host.device.type, "cpu")
++                self.assertTrue(host.is_pinned())
++            batch.append_batch_kv_cache(tail[1, :, 0, 0], tail[1, :, 1, 0], 1)
++            with torch.cuda.stream(torch.cuda.Stream()):
++                with self.assertRaisesRegex(RuntimeError, "share one compute stream"):
++                    batch.batch_attn_fwd(q, 1)
++            self.assertTrue(frame.region._forward_failed)
++
+     def packed(self, history_length, queries, heads, dtype, *, draft=False, all_hot=False):
+         layers, dim = 2, 128
+         history = torch.randn((layers, history_length, 2, 1, heads, dim), device="cuda", dtype=dtype)
+--- before/serve/tests/test_kv_buffer_pool.py
++++ after/serve/tests/test_kv_buffer_pool.py
+@@ -25,6 +25,35 @@
+ class KVBufferPoolTest(unittest.TestCase):
+     def make_pool(self, size=1024):
+         return KVBufferPool(size, device="cpu", pin_memory=False)
++
++    def test_end_allocations_are_aligned_with_an_unaligned_arena_boundary(self):
++        pool = self.make_pool(1027)
++        hot = pool.allocate((128,), torch.float16)
++        restore = pool.allocate((128,), torch.float16, from_end=True)
++        self.assertEqual((hot.offset, restore.offset), (0, 768))
++        self.assertEqual(pool._free, [(256, 512), (1024, 3)])
++        hot.tensor.fill_(3)
++        restore.tensor.fill_(7)
++        self.assertTrue(torch.all(hot.tensor == 3))
++        self.assertEqual(pool.stats()["largest_free_bytes"], 512)
++        restore.release(); hot.release()
++        self.assertEqual(pool._free, [(0, 1027)])
++        pool.close()
++
++    def test_replacement_hot_leases_do_not_split_growing_restore_space(self):
++        pool = self.make_pool(16 * 256)
++        hot = pool.allocate((256,), torch.uint8)
++        for cold_blocks in (8, 9, 10, 11):
++            restore = pool.allocate((cold_blocks * 256,), torch.uint8, from_end=True)
++            replacement = pool.allocate((256,), torch.uint8)
++            restore.tensor.fill_(cold_blocks)
++            replacement.tensor.fill_(23)
++            self.assertTrue(torch.all(restore.tensor == cold_blocks))
++            hot.release(); restore.release()
++            hot = replacement
++        hot.release()
++        self.assertEqual(pool._free, [(0, 16 * 256)])
++        pool.close()
+ 
+     def test_typed_views_do_not_overlap(self):
+         pool = self.make_pool()
+--- before/serve/tests/test_kv_partition.py
++++ after/serve/tests/test_kv_partition.py
+@@ -5,7 +5,7 @@
+ 
+ import os
+ import unittest
+-from unittest.mock import Mock
++from unittest.mock import Mock, patch
+ 
+ import torch
+ 
+@@ -164,7 +164,8 @@
+ @unittest.skipUnless(os.environ.get("RUN_KV_PARTITION_GPU") == "1" and torch.cuda.is_available(),
+                      "CUDA migration tests await an available GPU")
+ class PackedKVRegionTest(unittest.TestCase):
+-    def make_region(self, recent=2, selected_count=2, *, cpu_pool=None, gpu_pool=None):
++    def make_region(self, recent=2, selected_count=2, *, cpu_pool=None, gpu_pool=None,
++                    hot_capacity=None, cold_capacity=None):
+         full, selected = make_selection()
+         full, selected = full.cuda(), selected.cuda()
+         plan = partition_pages(full, selected, selected_count, pool_capacity=13,
+@@ -174,8 +175,38 @@
+         producer_ready = torch.cuda.current_stream().record_event()
+         region = PackedKVRegion.start_offload(source, plan, tail_capacity=4, chunk_pages=2,
+                                               source_ready=producer_ready, stream=torch.cuda.Stream(),
+-                                              cpu_pool=cpu_pool, gpu_pool=gpu_pool)
++                                              cpu_pool=cpu_pool, gpu_pool=gpu_pool,
++                                              hot_capacity=hot_capacity, cold_capacity=cold_capacity)
+         return source, plan, region
++
++    def test_reserved_capacity_keeps_live_cold_contiguous_without_padding_transfer(self):
++        cpu = KVBufferPool(4096)
++        gpu = KVBufferPool(8192, device="cuda")
++        cpu._buffer.view(torch.float16).fill_(1234)
++        source, plan, region = self.make_region(cpu_pool=cpu, gpu_pool=gpu,
++                                              hot_capacity=12, cold_capacity=9)
++        restored = None
++        try:
++            region.finish_offload()
++            self.assertEqual(region.hot_kv.shape[1], plan.hot_count + 4)
++            self.assertEqual(region._cold_cpu.shape[1], plan.cold_count)
++            self.assertTrue(region._cold_cpu.is_contiguous())
++            torch.testing.assert_close(region._cold_cpu, reference_pack(source, plan.cold_pages, plan.cold_count).cpu())
++            live = region._cold_cpu.numel()
++            self.assertTrue(torch.all(region._leases["cold"].tensor.reshape(-1)[live:] == 1234))
++            original = PackedKVRegion._copy_contiguous_layers
++            with patch.object(PackedKVRegion, "_copy_contiguous_layers", side_effect=original) as copy:
++                restored = region.restore_chunk(0, region.cold_count)
++                restored.ready.synchronize()
++                self.assertEqual(copy.call_count, 1)
++                self.assertEqual(copy.call_args.args[1].nbytes, region._cold_cpu.nbytes)
++                self.assertLess(copy.call_args.args[1].nbytes, region._leases["cold"].tensor.nbytes)
++            torch.testing.assert_close(restored.kv, reference_pack(source, plan.cold_pages, plan.cold_count))
++        finally:
++            if restored is not None:
++                restored.release(consumer_done=restored.ready)
++            region.close(consumer_done=torch.cuda.current_stream().record_event())
++            gpu.close(wait=True); cpu.close(wait=True)
+ 
+     def test_hot_and_cold_round_trip(self):
+         source, plan, region = self.make_region()
+--- before/serve/tests/test_packed_batch.py
++++ after/serve/tests/test_packed_batch.py
+@@ -40,6 +40,16 @@
+ 
+ 
+ class PackedBatchTest(unittest.TestCase):
++    def test_query_head_geometry_cannot_change_after_rope_metadata_is_bound(self):
++        batch, q, new_tail1, _, tail2, _ = batch_fixture()
++        keys = torch.cat((new_tail1[0, :, 0, 0], tail2[0, :, 0, 0]))
++        batch.apply_batch_rope(q, keys, CONFIG)
++        with self.assertRaisesRegex(ValueError, "head count must remain fixed"):
++            batch.apply_batch_rope(q.repeat_interleave(2, dim=1), keys, CONFIG)
++        batch.abort()
++        for frame in batch.frames:
++            self.assertFalse(getattr(frame.region, "_forward_failed", False))
++
+     def test_mixed_draft_verify_model_calls_preserve_request_outputs(self):
+         batch, q, new_tail1, history2, tail2, calls = batch_fixture()
+         self.assertEqual(batch.num_tokens, 4)
+--- before/serve/tests/test_packed_scheduler.py
++++ after/serve/tests/test_packed_scheduler.py
+@@ -1,17 +1,135 @@
+ """Check verify planning against explicit arena capacity before any restore."""
+ 
+ import unittest
++import itertools
++import math
+ from types import SimpleNamespace
++from unittest.mock import Mock
+ 
+ import torch
+ 
+ from serve.attention.kv_buffer_pool import KVBufferPool
+ from serve.attention.kv_partition import PackedKVRegion
+ from serve.scheduler.packed_scheduler import PackedSpecScheduler
++from serve.request.request import Request
++
++
++class MixedVerifySchedulingTest(unittest.TestCase):
++    def test_capacity_deferred_ready_request_stays_parked_while_others_compute(self):
++        scheduler = PackedSpecScheduler.__new__(PackedSpecScheduler)
++        scheduler.k, scheduler.dense_reference, scheduler.rank = 4, False, 0
++        scheduler.metrics = dict(verify_model_forwards=0, max_verify_batch=0, verify_batch_histogram={})
++        states = [SimpleNamespace(
++            request=SimpleNamespace(request_id=i, len_output=20, len_input=4),
++            region=SimpleNamespace(length=2), output=[9] if i < 3 else [],
++            drafts=[1] * n, draft_probs=[]) for i, n in enumerate((4, 4, 2, 0))]
++        frames = [SimpleNamespace(_finished=True, _aborted=False) for _ in states]
++        scheduler._prepare_verify = Mock(return_value=(frames[0], None, [9] + states[0].drafts))
++        scheduler._nonverify_entries = Mock(return_value=[
++            (states[2], frames[2], [1], "draft"), (states[3], frames[3], [2, 3], "prefill")])
++        probs = torch.arange(24).reshape(8, 3)
++        scheduler._forward = Mock(return_value=(list(range(100, 108)), probs))
++        scheduler._commit_verify = Mock()
++        scheduler._verify_many([states[0]], states, [])
++        self.assertEqual([id(s) for s in scheduler._nonverify_entries.call_args.args[0]],
++                         [id(states[2]), id(states[3])])
++        entries = scheduler._forward.call_args.args[0]
++        self.assertEqual([(s.request.request_id, phase) for s, _, _, phase in entries],
++                         [(0, "verify"), (2, "draft"), (3, "prefill")])
++        self.assertEqual(states[1].drafts, [1] * 4)
++        self.assertEqual(states[2].drafts, [1, 1, 105])
++        torch.testing.assert_close(states[2].draft_probs[0], probs[5:6])
++        self.assertEqual(scheduler._commit_verify.call_args.args[-2], list(range(100, 105)))
++        torch.testing.assert_close(scheduler._commit_verify.call_args.args[-1], probs[:5])
++
++
++class AdmissionPeakTest(unittest.TestCase):
++    def scheduler(self):
++        scheduler = PackedSpecScheduler.__new__(PackedSpecScheduler)
++        scheduler.k, scheduler.r, scheduler.minimum, scheduler.token_bytes = 4, .1, 128, 256
++        scheduler.dense_reference = scheduler.retain_full_reference = False
++        return scheduler
++
++    def test_long_request_fits_initial_and_future_peak_without_two_full_histories(self):
++        scheduler = self.scheduler()
++        request = SimpleNamespace(len_input=20000, len_output=512)
++        scheduler.gpu_pool = SimpleNamespace(capacity_bytes=24000 * 256, alignment=256)
++        scheduler.cpu_pool = SimpleNamespace(capacity_bytes=40000 * 256)
++        self.assertTrue(scheduler._fits([], request))
++        base, extra, _, _ = scheduler._estimate(request, packed=False)
++        packed_base, packed_extra, _, _ = scheduler._estimate(request, packed=True)
++        full_allocation = (request.len_input + scheduler.k + 1) * 256
++        self.assertGreaterEqual(base + extra, full_allocation + packed_base)
++        self.assertGreaterEqual(base + extra, packed_base + packed_extra)
++        self.assertLess(base + extra, 2 * request.len_input * 256)
++
++    def test_all_full_to_packed_transitions_preserve_one_verify_headroom(self):
++        scheduler = self.scheduler()
++        requests = [SimpleNamespace(len_input=n, len_output=512) for n in (20000, 8000, 128, 29)]
++        estimates = [scheduler._estimate(r, packed=False) for r in requests]
++        reserved = sum(e[0] for e in estimates) + max(e[1] for e in estimates)
++        # Exhaust every subset of requests that has completed its first pack.
++        # A single remaining request's first pack or later restore/repack must
++        # fit under the original reservation, including final history growth.
++        for packed in itertools.product((False, True), repeat=len(requests)):
++            current = [scheduler._estimate(r, packed=p) for r, p in zip(requests, packed)]
++            self.assertLessEqual(sum(e[0] for e in current) + max(e[1] for e in current), reserved)
++            actual_bases, migration_peaks = [], []
++            for request, is_packed in zip(requests, packed):
++                history = request.len_input + request.len_output - 1
++                hot = min(history, max(128, math.ceil(history * .1), 6))
++                cold = history - min(history, max(128, math.ceil(history * .1), 2))
++                packed_allocation = hot + 5
++                actual_bases.append((packed_allocation if is_packed else request.len_input + 5) * 256)
++                migration_peaks.append((packed_allocation + (cold if is_packed else 0)) * 256)
++            self.assertLessEqual(sum(actual_bases) + max(migration_peaks), reserved)
+ 
+ 
+ @unittest.skipUnless(torch.cuda.is_available(), "CUDA arenas require an available GPU")
+ class VerifyCapacityTest(unittest.TestCase):
++    def test_real_kv_pipeline_under_pressure_and_growing_cold_history(self):
++        class TinyModel(torch.nn.Module):
++            def __init__(self):
++                super().__init__()
++                self.weight = torch.nn.Parameter(torch.zeros((), device="cuda", dtype=torch.bfloat16))
++                self.config = SimpleNamespace(num_layers=2, num_kv_heads=2, head_dim=128,
++                    vocab_size=128, scaling_factor=1., rope_base=10000.,
++                    high_freq_factor=None, low_freq_factor=None)
++
++            def attach_kv_pool(self, pool):
++                self.pool = pool
++
++            def forward(self, inputs):
++                for layer in range(2):
++                    q = torch.zeros((len(inputs), 8, 128), device=inputs.device, dtype=self.weight.dtype)
++                    k = torch.zeros((len(inputs), 2, 128), device=inputs.device, dtype=self.weight.dtype)
++                    q, k = self.pool.apply_batch_rope(q, k, self.config)
++                    self.pool.append_batch_kv_cache(k, k, layer)
++                    self.pool.batch_attn_fwd(q, layer)
++                logits = torch.zeros((len(inputs), 128), device=inputs.device, dtype=self.weight.dtype)
++                logits[:, 1] = 20
++                return logits
++
++        model, token_bytes = TinyModel(), 2048
++        for prompt_length, output_length, requests, gpu_tokens, cpu_tokens in (
++                (250, 24, 4, 1000, 2048), (20000, 512, 1, 24000, 40000)):
++            gpu = KVBufferPool(gpu_tokens * token_bytes, device="cuda")
++            cpu = KVBufferPool(cpu_tokens * token_bytes)
++            try:
++                scheduler = PackedSpecScheduler(model, gpu, cpu, chunk_size=512,
++                    num_min_budget=16, max_batch_size=4)
++                with torch.inference_mode():
++                    completed = scheduler.run([Request([1] * prompt_length, output_length) for _ in range(requests)])
++                self.assertEqual([len(r.token_ids) - r.len_input for r in completed], [output_length] * requests)
++                self.assertGreater(scheduler.metrics["migrations"], 3)
++                self.assertEqual(gpu.stats()["in_use_bytes"], 0)
++                self.assertEqual(cpu.stats()["in_use_bytes"], 0)
++                if requests == 4:
++                    self.assertGreater(scheduler.metrics["admission_waits"], 0)
++                    self.assertEqual(scheduler.metrics["max_actual_batch"], 4)
++            finally:
++                gpu.close(wait=True); cpu.close(wait=True)
++
+     def fixture(self, free_gpu_tokens, free_cpu_tokens):
+         # Four current histories each own 16 hot + 5 tail slots on GPU and
+         # 84 cold slots on CPU. A verify needs 84 restored slots plus 21 new
+@@ -26,11 +144,12 @@
+             region = PackedKVRegion()
+             region.hot_count, region.cold_count = 16, 84
+             states.append(SimpleNamespace(region=region, round_start=100, drafts=[1] * 4,
+-                                          request=SimpleNamespace(request_id=i)))
++                                          output=[0], request=SimpleNamespace(request_id=i, len_input=100, len_output=6)))
+         scheduler = PackedSpecScheduler.__new__(PackedSpecScheduler)
+         scheduler.gpu_pool, scheduler.cpu_pool = gpu, cpu
+         scheduler.token_bytes, scheduler.k, scheduler.minimum, scheduler.r = 256, 4, 16, .1
+         scheduler.group, scheduler.rank, scheduler.retain_full_reference = None, 0, False
++        scheduler.dense_reference = False
+         scheduler._log = lambda *args, **kwargs: None
+         return scheduler, states, leases
+ 
+@@ -61,6 +180,18 @@
+     def test_infeasible_configuration_fails_before_restore(self):
+         self.check(104, 356, 0)
+ 
++    def test_final_round_needs_restore_but_no_replacement(self):
++        scheduler, states, leases = self.fixture(84, 0)
++        states[0].request.len_output = 2
++        states[0].drafts = []
++        try:
++            self.assertEqual([s.request.request_id for s in scheduler._verify_group(states)], [0])
++        finally:
++            for lease in leases:
++                lease.release()
++            scheduler.gpu_pool.close(wait=True)
++            scheduler.cpu_pool.close(wait=True)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+--- before/serve/tests/validate_packed_serving.py
++++ after/serve/tests/validate_packed_serving.py
+@@ -107,6 +107,7 @@
+     print(f"rank={rank} loaded real Qwen3-8B TP={world} in {time.perf_counter()-started:.1f}s", flush=True)
+     results = []
+     audits = {}
++    generations = {}
+ 
+     def trial(name, inputs, output_length=32, *, dense=False, k=4, r=.1, temp=0., gpu_bytes=None,
+               cpu_bytes=1024 * 1024**2, chunk_size=32, full_spec=False):
+@@ -143,13 +144,62 @@
+             if rank == 0:
+                 json.dump(dict(stats=stats, outputs=outputs),
+                           open(os.path.join(args.output, name, "result.json"), "w"), indent=2)
+-            print(f"rank={rank} passed {name}: {stats}", flush=True)
++            print(f"rank={rank} completed_inference {name}: {stats}", flush=True)
+             results.append(stats)
+             audits[name] = scheduler.target_logits
++            generations[name] = outputs
+             return outputs, stats
+         finally:
+             cpu.close(wait=True)
+             gpu.close(wait=True)
++
++    def check_greedy(name, outputs, expected, stats, *, dense_name, full_name=None):
++        diagnostics = None
++        if outputs != expected:
++            differences = [(i, next(j for j, (a, b) in enumerate(zip(got, ref)) if a != b))
++                           for i, (got, ref) in enumerate(zip(outputs, expected)) if got != ref]
++            if rank == 0:
++                diagnostics = []
++                for request_id, position in differences:
++                    dense = audits[dense_name][request_id, position]
++                    packed = audits[name][request_id, position]
++                    delta = packed - dense
++                    top_values, top_ids = dense.topk(2)
++                    row = dict(request_id=request_id, position=position,
++                        dense_token=int(dense.argmax()), packed_token=int(packed.argmax()),
++                        dense_top2_ids=top_ids.tolist(), dense_top2_logits=top_values.tolist(),
++                        packed_logits_for_dense_top2=packed[top_ids].tolist(),
++                        max_abs_logit_error=float(delta.abs().max()),
++                        rmse=float(delta.square().mean().sqrt()),
++                        relative_rmse=float(delta.square().mean().sqrt() / dense.square().mean().sqrt()),
++                        cosine=float(torch.nn.functional.cosine_similarity(dense, packed, dim=0)))
++                    if full_name is not None:
++                        same_prefix = generations[full_name][request_id][:position] == expected[request_id][:position]
++                        row["full_spec_same_prefix"] = same_prefix
++                        if same_prefix:
++                            full = audits[full_name][request_id, position]
++                            row.update(full_spec_token=int(full.argmax()),
++                                full_spec_logits_for_dense_top2=full[top_ids].tolist(),
++                                full_spec_vs_ar_max_error=float((full - dense).abs().max()),
++                                packed_vs_full_spec_max_error=float((packed - full).abs().max()))
++                    diagnostics.append(row)
++            if control is not None:
++                holder = [diagnostics]
++                dist.broadcast_object_list(holder, src=0, group=control)
++                diagnostics = holder[0]
++            print(f"rank={rank} GREEDY_NUMERICAL_DIAGNOSTICS {name}: {diagnostics}", flush=True)
++            # Same bounds for every case. A changed argmax is recorded as
++            # nonexact; no tolerance is enlarged to make a failing case pass.
++            for row in diagnostics:
++                assert row["max_abs_logit_error"] <= .5 and row["relative_rmse"] <= .015
++                assert row["cosine"] >= .9999
++                gap = row["dense_top2_logits"][0] - row["dense_top2_logits"][1]
++                assert gap <= 2 * row["max_abs_logit_error"]
++            stats["greedy_numerical_differences"] = diagnostics
++        stats["greedy_matches_dense_ar"] = outputs == expected
++        if rank == 0:
++            json.dump(dict(exact=outputs == expected, diagnostics=diagnostics),
++                      open(os.path.join(args.output, name, "greedy-check.json"), "w"), indent=2)
+ 
+     try:
+         expected, _ = trial("dense-ar", normal, dense=True)
+@@ -200,12 +250,14 @@
+                     assert gap <= 2 * row["max_abs_logit_error"]
+                 stats["greedy_numerical_differences"] = diagnostics
+             stats["greedy_matches_dense_ar"] = outputs == expected
++            assert stats["mixed_verify_draft_forwards"] > 0, "No mixed verify/draft forward exercised"
++            assert stats["mixed_verify_prefill_forwards"] > 0, "No mixed verify/prefill forward exercised"
+         trial("stochastic", normal[:2], temp=.65)
+         # Identical 250-token inputs isolate resource reuse from semantics.
+         pressure = [normal[-1][:230] + normal[-1][-20:] for _ in range(4)]
+         token_bytes = model.config.num_layers * 2 * model.config.num_kv_heads * model.config.head_dim * 2
+         outputs, stats = trial("pressure", pressure, output_length=24,
+-                               gpu_bytes=1150 * token_bytes)
++                               gpu_bytes=1000 * token_bytes)
+         assert stats["admission_waits"] > 0, "Workload did not reach arena admission pressure"
+         rows = [json.loads(line) for line in open(os.path.join(args.output, "pressure",
+                                                               f"kv-events.rank{rank}.jsonl"))]
+@@ -220,6 +272,25 @@
+         assert len(long_ids) > 4000
+         assert long_outputs == long_expected, "Long-context greedy output differs from dense AR"
+         long_stats["greedy_matches_dense_ar"] = True
++        constrained_ids = prompt("Summarize the following technical notes in detail. "
++                                 + "A cache retains recently used data to reduce memory access latency. " * 1700)
++        assert 20000 < len(constrained_ids) < 22000
++        # The arena fits the lifecycle peak but cannot hold two full histories.
++        # Per-rank token budgets keep this boundary identical under TP1/TP2.
++        constrained_gpu, constrained_cpu = 24000 * token_bytes, 40000 * token_bytes
++        assert 2 * len(constrained_ids) * token_bytes > constrained_gpu
++        constrained_expected, _ = trial("long-constrained-dense-ar", [constrained_ids],
++            output_length=12, dense=True, gpu_bytes=constrained_gpu, cpu_bytes=constrained_cpu, chunk_size=512)
++        constrained_outputs, constrained_stats = trial("long-constrained-packed", [constrained_ids],
++            output_length=12, gpu_bytes=constrained_gpu, cpu_bytes=constrained_cpu, chunk_size=512)
++        full_name = None
++        if constrained_outputs != constrained_expected:
++            full_name = "long-constrained-full-self-spec"
++            _, full_stats = trial(full_name, [constrained_ids], output_length=12, full_spec=True,
++                gpu_bytes=constrained_gpu, cpu_bytes=constrained_cpu, chunk_size=512)
++            full_stats["greedy_matches_dense_ar"] = generations[full_name] == constrained_expected
++        check_greedy("long-constrained-packed", constrained_outputs, constrained_expected, constrained_stats,
++                     dense_name="long-constrained-dense-ar", full_name=full_name)
+         # All-rank failure propagation before any model collective.
+         def fail_one_rank():
+             if rank == world - 1:

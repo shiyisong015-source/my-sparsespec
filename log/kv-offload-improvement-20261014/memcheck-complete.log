@@ -1,0 +1,9 @@
+========= COMPUTE-SANITIZER
+/data/users/songshiyi/vericache/.venv-vllm011/lib/python3.12/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 10-14 02:44:12 [__init__.py:216] Automatically detected platform cuda.
+----------------------------------------------------------------------
+Ran 27 tests in 6.498s
+
+OK
+========= ERROR SUMMARY: 0 errors

@@ -172,7 +172,26 @@ def run_inference(
     enable_torch_profiler: bool = False,
     step_log_path: str = None,
     seed: int = 330,
+    packed_gpu_pool_mib: int = None,
+    packed_cpu_pool_mib: int = None,
 ):
+    if kv_cache == "packed":
+        if cuda_graph or async_cpu or debug or step_log_path is not None or enable_torch_profiler:
+            raise ValueError("Packed KV currently requires eager synchronous scheduling; "
+                             "use its kv-events/rounds logs for this implementation")
+        if batch_policy != "greedy" or perf_sim or vanilla_attn:
+            raise ValueError("Packed KV currently supports greedy batches and FlashInfer FA2")
+        from serve.packed_run import run_packed_inference
+
+        return run_packed_inference(
+            reqs, model_name, max_batch_size=max_batch_size, tp_ranks=tp_ranks,
+            max_mem_per_rank=max_mem_per_rank, mem_fraction=mem_fraction, dtype=dtype,
+            reduce_method=reduce_method, chunk_size=chunk_size, clip_length=clip_length,
+            spec_stride=spec_stride, budget_ratio=budget_ratio, num_min_budget=num_min_budget,
+            temperature=temperature, seed=seed, result_dir=result_dir,
+            acceptance_log_path=acceptance_log_path, gpu_pool_mib=packed_gpu_pool_mib,
+            cpu_pool_mib=packed_cpu_pool_mib,
+        )
     # Ensure logging is configured for library use
     if not logging.getLogger().hasHandlers():
         global_logging_config()
@@ -613,7 +632,7 @@ if __name__ == "__main__":
         choices=["float16", "float32", "bfloat16"],
     )
     argparser.add_argument(
-        "--kv_cache", type=str, default="full", choices=["full", "streaming", "pillar"]
+        "--kv_cache", type=str, default="full", choices=["full", "streaming", "pillar", "packed"]
     )
     argparser.add_argument(
         "--admit_policy",
@@ -649,6 +668,10 @@ if __name__ == "__main__":
     argparser.add_argument("--spec_stride", type=int, default=16)
     argparser.add_argument("--budget_ratio", type=float, default=0.05)
     argparser.add_argument("--num_min_budget", type=int, default=128)
+    argparser.add_argument("--packed_gpu_pool_mib", type=int, default=None,
+                           help="GPU KV arena per TP rank, including restore/repack workspaces")
+    argparser.add_argument("--packed_cpu_pool_mib", type=int, default=None,
+                           help="Pinned CPU KV arena per TP rank")
     argparser.add_argument("--temperature", type=float, default=0.0)
 
     argparser.add_argument("--perf_sim", action="store_true")
@@ -705,4 +728,6 @@ if __name__ == "__main__":
         vanilla_attn=args.vanilla_attn,
         dataset_name=args.dataset_name,
         enable_torch_profiler=args.enable_torch_profiler,
+        packed_gpu_pool_mib=args.packed_gpu_pool_mib,
+        packed_cpu_pool_mib=args.packed_cpu_pool_mib,
     )

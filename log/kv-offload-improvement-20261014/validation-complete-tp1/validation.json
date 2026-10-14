@@ -1,0 +1,779 @@
+{
+  "status": "passed_with_numerical_difference",
+  "tp": 1,
+  "tests": [
+    {
+      "name": "dense-ar",
+      "k": 4,
+      "r": 0.1,
+      "temperature": 0.0,
+      "seconds": 2.875016611069441,
+      "input_lengths": [
+        29,
+        234,
+        628
+      ],
+      "output_lengths": [
+        32,
+        32,
+        32
+      ],
+      "forwards": 51,
+      "verify_forwards": 0,
+      "migrations": 0,
+      "restores": 0,
+      "admission_waits": 0,
+      "max_actual_batch": 3,
+      "mixed_prefill_draft_forwards": 0,
+      "mixed_verify_draft_forwards": 0,
+      "mixed_verify_prefill_forwards": 0,
+      "verify_model_forwards": 0,
+      "max_verify_batch": 0,
+      "verify_batch_histogram": {},
+      "d2h_bytes": 0,
+      "h2d_bytes": 0,
+      "full_bytes_returned": 0,
+      "attention_grid": {
+        "forwards": 51,
+        "minimum_blocks": 48,
+        "maximum_blocks": 184,
+        "estimated_idle_ratio_sum": 30.296296296296315,
+        "workspace_peak_bytes": 2974336
+      },
+      "accepted_draft_tokens": 0,
+      "proposed_draft_tokens": 0,
+      "gpu": {
+        "capacity_bytes": 536870912,
+        "reserved_bytes": 536870912,
+        "in_use_bytes": 0,
+        "free_bytes": 536870912,
+        "peak_bytes": 145539072,
+        "largest_free_bytes": 536870912,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "cpu": {
+        "capacity_bytes": 1073741824,
+        "reserved_bytes": 1073741824,
+        "in_use_bytes": 0,
+        "free_bytes": 1073741824,
+        "peak_bytes": 0,
+        "largest_free_bytes": 1073741824,
+        "pending_bytes": 0,
+        "active_leases": 0
+      }
+    },
+    {
+      "name": "full-self-spec-k14",
+      "k": 14,
+      "r": 0.1,
+      "temperature": 0.0,
+      "seconds": 1.7121592639014125,
+      "input_lengths": [
+        29,
+        234,
+        628
+      ],
+      "output_lengths": [
+        32,
+        32,
+        32
+      ],
+      "forwards": 51,
+      "verify_forwards": 9,
+      "migrations": 0,
+      "restores": 0,
+      "admission_waits": 0,
+      "max_actual_batch": 3,
+      "mixed_prefill_draft_forwards": 19,
+      "mixed_verify_draft_forwards": 7,
+      "mixed_verify_prefill_forwards": 1,
+      "verify_model_forwards": 9,
+      "max_verify_batch": 1,
+      "verify_batch_histogram": {
+        "1": 9
+      },
+      "d2h_bytes": 0,
+      "h2d_bytes": 0,
+      "full_bytes_returned": 0,
+      "attention_grid": {
+        "forwards": 51,
+        "minimum_blocks": 48,
+        "maximum_blocks": 184,
+        "estimated_idle_ratio_sum": 29.592592592592613,
+        "workspace_peak_bytes": 2974336
+      },
+      "accepted_draft_tokens": 84,
+      "proposed_draft_tokens": 84,
+      "gpu": {
+        "capacity_bytes": 536870912,
+        "reserved_bytes": 536870912,
+        "in_use_bytes": 0,
+        "free_bytes": 536870912,
+        "peak_bytes": 145539072,
+        "largest_free_bytes": 536870912,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "cpu": {
+        "capacity_bytes": 1073741824,
+        "reserved_bytes": 1073741824,
+        "in_use_bytes": 0,
+        "free_bytes": 1073741824,
+        "peak_bytes": 0,
+        "largest_free_bytes": 1073741824,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "greedy_matches_dense_ar": true
+    },
+    {
+      "name": "packed-k4-r0.05",
+      "k": 4,
+      "r": 0.05,
+      "temperature": 0.0,
+      "seconds": 2.098624075995758,
+      "input_lengths": [
+        29,
+        234,
+        628
+      ],
+      "output_lengths": [
+        32,
+        32,
+        32
+      ],
+      "forwards": 55,
+      "verify_forwards": 22,
+      "migrations": 19,
+      "restores": 19,
+      "admission_waits": 0,
+      "max_actual_batch": 3,
+      "mixed_prefill_draft_forwards": 18,
+      "mixed_verify_draft_forwards": 18,
+      "mixed_verify_prefill_forwards": 5,
+      "verify_model_forwards": 22,
+      "max_verify_batch": 1,
+      "verify_batch_histogram": {
+        "1": 22
+      },
+      "d2h_bytes": 779304960,
+      "h2d_bytes": 779304960,
+      "full_bytes_returned": 133595136,
+      "attention_grid": {
+        "forwards": 55,
+        "minimum_blocks": 8,
+        "maximum_blocks": 192,
+        "estimated_idle_ratio_sum": 37.8148148148148,
+        "workspace_peak_bytes": 3222272
+      },
+      "accepted_draft_tokens": 71,
+      "proposed_draft_tokens": 85,
+      "gpu": {
+        "capacity_bytes": 536870912,
+        "reserved_bytes": 536870912,
+        "in_use_bytes": 0,
+        "free_bytes": 536870912,
+        "peak_bytes": 137428992,
+        "largest_free_bytes": 536870912,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "cpu": {
+        "capacity_bytes": 1073741824,
+        "reserved_bytes": 1073741824,
+        "in_use_bytes": 0,
+        "free_bytes": 1073741824,
+        "peak_bytes": 227819520,
+        "largest_free_bytes": 1073741824,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "greedy_matches_dense_ar": true
+    },
+    {
+      "name": "packed-k4-r0.25",
+      "k": 4,
+      "r": 0.25,
+      "temperature": 0.0,
+      "seconds": 1.8715477690566331,
+      "input_lengths": [
+        29,
+        234,
+        628
+      ],
+      "output_lengths": [
+        32,
+        32,
+        32
+      ],
+      "forwards": 51,
+      "verify_forwards": 22,
+      "migrations": 19,
+      "restores": 19,
+      "admission_waits": 0,
+      "max_actual_batch": 3,
+      "mixed_prefill_draft_forwards": 18,
+      "mixed_verify_draft_forwards": 16,
+      "mixed_verify_prefill_forwards": 5,
+      "verify_model_forwards": 21,
+      "max_verify_batch": 2,
+      "verify_batch_histogram": {
+        "1": 20,
+        "2": 1
+      },
+      "d2h_bytes": 624918528,
+      "h2d_bytes": 624918528,
+      "full_bytes_returned": 133595136,
+      "attention_grid": {
+        "forwards": 51,
+        "minimum_blocks": 16,
+        "maximum_blocks": 192,
+        "estimated_idle_ratio_sum": 33.333333333333336,
+        "workspace_peak_bytes": 3222272
+      },
+      "accepted_draft_tokens": 71,
+      "proposed_draft_tokens": 78,
+      "gpu": {
+        "capacity_bytes": 536870912,
+        "reserved_bytes": 536870912,
+        "in_use_bytes": 0,
+        "free_bytes": 536870912,
+        "peak_bytes": 144654336,
+        "largest_free_bytes": 536870912,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "cpu": {
+        "capacity_bytes": 1073741824,
+        "reserved_bytes": 1073741824,
+        "in_use_bytes": 0,
+        "free_bytes": 1073741824,
+        "peak_bytes": 181370880,
+        "largest_free_bytes": 1073741824,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "greedy_matches_dense_ar": true
+    },
+    {
+      "name": "packed-k14-r0.1",
+      "k": 14,
+      "r": 0.1,
+      "temperature": 0.0,
+      "seconds": 1.876405811868608,
+      "input_lengths": [
+        29,
+        234,
+        628
+      ],
+      "output_lengths": [
+        32,
+        32,
+        32
+      ],
+      "forwards": 55,
+      "verify_forwards": 9,
+      "migrations": 6,
+      "restores": 6,
+      "admission_waits": 0,
+      "max_actual_batch": 3,
+      "mixed_prefill_draft_forwards": 19,
+      "mixed_verify_draft_forwards": 7,
+      "mixed_verify_prefill_forwards": 1,
+      "verify_model_forwards": 9,
+      "max_verify_batch": 1,
+      "verify_batch_histogram": {
+        "1": 9
+      },
+      "d2h_bytes": 248315904,
+      "h2d_bytes": 248315904,
+      "full_bytes_returned": 138018816,
+      "attention_grid": {
+        "forwards": 55,
+        "minimum_blocks": 8,
+        "maximum_blocks": 184,
+        "estimated_idle_ratio_sum": 36.11111111111111,
+        "workspace_peak_bytes": 2974336
+      },
+      "accepted_draft_tokens": 84,
+      "proposed_draft_tokens": 102,
+      "gpu": {
+        "capacity_bytes": 536870912,
+        "reserved_bytes": 536870912,
+        "in_use_bytes": 0,
+        "free_bytes": 536870912,
+        "peak_bytes": 142589952,
+        "largest_free_bytes": 536870912,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "cpu": {
+        "capacity_bytes": 1073741824,
+        "reserved_bytes": 1073741824,
+        "in_use_bytes": 0,
+        "free_bytes": 1073741824,
+        "peak_bytes": 174882816,
+        "largest_free_bytes": 1073741824,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "greedy_matches_dense_ar": true
+    },
+    {
+      "name": "stochastic",
+      "k": 4,
+      "r": 0.1,
+      "temperature": 0.65,
+      "seconds": 1.3460859539918602,
+      "input_lengths": [
+        29,
+        234
+      ],
+      "output_lengths": [
+        32,
+        32
+      ],
+      "forwards": 39,
+      "verify_forwards": 14,
+      "migrations": 12,
+      "restores": 12,
+      "admission_waits": 0,
+      "max_actual_batch": 2,
+      "mixed_prefill_draft_forwards": 6,
+      "mixed_verify_draft_forwards": 10,
+      "mixed_verify_prefill_forwards": 1,
+      "verify_model_forwards": 14,
+      "max_verify_batch": 1,
+      "verify_batch_histogram": {
+        "1": 14
+      },
+      "d2h_bytes": 226934784,
+      "h2d_bytes": 226934784,
+      "full_bytes_returned": 40255488,
+      "attention_grid": {
+        "forwards": 39,
+        "minimum_blocks": 8,
+        "maximum_blocks": 72,
+        "estimated_idle_ratio_sum": 34.074074074074076,
+        "workspace_peak_bytes": 1514752
+      },
+      "accepted_draft_tokens": 48,
+      "proposed_draft_tokens": 48,
+      "gpu": {
+        "capacity_bytes": 536870912,
+        "reserved_bytes": 536870912,
+        "in_use_bytes": 0,
+        "free_bytes": 536870912,
+        "peak_bytes": 45563904,
+        "largest_free_bytes": 536870912,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "cpu": {
+        "capacity_bytes": 1073741824,
+        "reserved_bytes": 1073741824,
+        "in_use_bytes": 0,
+        "free_bytes": 1073741824,
+        "peak_bytes": 76677120,
+        "largest_free_bytes": 1073741824,
+        "pending_bytes": 0,
+        "active_leases": 0
+      }
+    },
+    {
+      "name": "pressure",
+      "k": 4,
+      "r": 0.1,
+      "temperature": 0.0,
+      "seconds": 1.6156322788447142,
+      "input_lengths": [
+        250,
+        250,
+        250,
+        250
+      ],
+      "output_lengths": [
+        24,
+        24,
+        24,
+        24
+      ],
+      "forwards": 44,
+      "verify_forwards": 20,
+      "migrations": 16,
+      "restores": 16,
+      "admission_waits": 13,
+      "max_actual_batch": 4,
+      "mixed_prefill_draft_forwards": 7,
+      "mixed_verify_draft_forwards": 8,
+      "mixed_verify_prefill_forwards": 2,
+      "verify_model_forwards": 13,
+      "max_verify_batch": 3,
+      "verify_batch_histogram": {
+        "3": 2,
+        "2": 3,
+        "1": 8
+      },
+      "d2h_bytes": 556793856,
+      "h2d_bytes": 556793856,
+      "full_bytes_returned": 150405120,
+      "attention_grid": {
+        "forwards": 44,
+        "minimum_blocks": 8,
+        "maximum_blocks": 192,
+        "estimated_idle_ratio_sum": 31.555555555555543,
+        "workspace_peak_bytes": 3969024
+      },
+      "accepted_draft_tokens": 72,
+      "proposed_draft_tokens": 72,
+      "gpu": {
+        "capacity_bytes": 147456000,
+        "reserved_bytes": 147456000,
+        "in_use_bytes": 0,
+        "free_bytes": 147456000,
+        "peak_bytes": 126074880,
+        "largest_free_bytes": 147456000,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "cpu": {
+        "capacity_bytes": 1073741824,
+        "reserved_bytes": 1073741824,
+        "in_use_bytes": 0,
+        "free_bytes": 1073741824,
+        "peak_bytes": 180633600,
+        "largest_free_bytes": 1073741824,
+        "pending_bytes": 0,
+        "active_leases": 0
+      }
+    },
+    {
+      "name": "long-dense-ar",
+      "k": 4,
+      "r": 0.1,
+      "temperature": 0.0,
+      "seconds": 1.0040771909989417,
+      "input_lengths": [
+        4823
+      ],
+      "output_lengths": [
+        12
+      ],
+      "forwards": 21,
+      "verify_forwards": 0,
+      "migrations": 0,
+      "restores": 0,
+      "admission_waits": 0,
+      "max_actual_batch": 1,
+      "mixed_prefill_draft_forwards": 0,
+      "mixed_verify_draft_forwards": 0,
+      "mixed_verify_prefill_forwards": 0,
+      "verify_model_forwards": 0,
+      "max_verify_batch": 0,
+      "verify_batch_histogram": {},
+      "d2h_bytes": 0,
+      "h2d_bytes": 0,
+      "full_bytes_returned": 0,
+      "attention_grid": {
+        "forwards": 21,
+        "minimum_blocks": 152,
+        "maximum_blocks": 1536,
+        "estimated_idle_ratio_sum": 4.417283950617284,
+        "workspace_peak_bytes": 29622272
+      },
+      "accepted_draft_tokens": 0,
+      "proposed_draft_tokens": 0,
+      "gpu": {
+        "capacity_bytes": 2147483648,
+        "reserved_bytes": 2147483648,
+        "in_use_bytes": 0,
+        "free_bytes": 2147483648,
+        "peak_bytes": 712949760,
+        "largest_free_bytes": 2147483648,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "cpu": {
+        "capacity_bytes": 2147483648,
+        "reserved_bytes": 2147483648,
+        "in_use_bytes": 0,
+        "free_bytes": 2147483648,
+        "peak_bytes": 0,
+        "largest_free_bytes": 2147483648,
+        "pending_bytes": 0,
+        "active_leases": 0
+      }
+    },
+    {
+      "name": "long-packed",
+      "k": 4,
+      "r": 0.1,
+      "temperature": 0.0,
+      "seconds": 1.2251814149785787,
+      "input_lengths": [
+        4823
+      ],
+      "output_lengths": [
+        12
+      ],
+      "forwards": 21,
+      "verify_forwards": 3,
+      "migrations": 2,
+      "restores": 2,
+      "admission_waits": 0,
+      "max_actual_batch": 1,
+      "mixed_prefill_draft_forwards": 0,
+      "mixed_verify_draft_forwards": 0,
+      "mixed_verify_prefill_forwards": 0,
+      "verify_model_forwards": 3,
+      "max_verify_batch": 1,
+      "verify_batch_histogram": {
+        "1": 3
+      },
+      "d2h_bytes": 1281982464,
+      "h2d_bytes": 1281982464,
+      "full_bytes_returned": 711917568,
+      "attention_grid": {
+        "forwards": 21,
+        "minimum_blocks": 32,
+        "maximum_blocks": 1536,
+        "estimated_idle_ratio_sum": 6.639506172839507,
+        "workspace_peak_bytes": 29622272
+      },
+      "accepted_draft_tokens": 8,
+      "proposed_draft_tokens": 8,
+      "gpu": {
+        "capacity_bytes": 2147483648,
+        "reserved_bytes": 2147483648,
+        "in_use_bytes": 0,
+        "free_bytes": 2147483648,
+        "peak_bytes": 784908288,
+        "largest_free_bytes": 2147483648,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "cpu": {
+        "capacity_bytes": 2147483648,
+        "reserved_bytes": 2147483648,
+        "in_use_bytes": 0,
+        "free_bytes": 2147483648,
+        "peak_bytes": 1282867200,
+        "largest_free_bytes": 2147483648,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "greedy_matches_dense_ar": true
+    },
+    {
+      "name": "long-constrained-dense-ar",
+      "k": 4,
+      "r": 0.1,
+      "temperature": 0.0,
+      "seconds": 5.416665620869026,
+      "input_lengths": [
+        20423
+      ],
+      "output_lengths": [
+        12
+      ],
+      "forwards": 51,
+      "verify_forwards": 0,
+      "migrations": 0,
+      "restores": 0,
+      "admission_waits": 0,
+      "max_actual_batch": 1,
+      "mixed_prefill_draft_forwards": 0,
+      "mixed_verify_draft_forwards": 0,
+      "mixed_verify_prefill_forwards": 0,
+      "verify_model_forwards": 0,
+      "max_verify_batch": 0,
+      "verify_batch_histogram": {},
+      "d2h_bytes": 0,
+      "h2d_bytes": 0,
+      "full_bytes_returned": 0,
+      "attention_grid": {
+        "forwards": 51,
+        "minimum_blocks": 216,
+        "maximum_blocks": 5120,
+        "estimated_idle_ratio_sum": 2.2578665916127223,
+        "workspace_peak_bytes": 88801280
+      },
+      "accepted_draft_tokens": 0,
+      "proposed_draft_tokens": 0,
+      "gpu": {
+        "capacity_bytes": 3538944000,
+        "reserved_bytes": 3538944000,
+        "in_use_bytes": 0,
+        "free_bytes": 3538944000,
+        "peak_bytes": 3013263360,
+        "largest_free_bytes": 3538944000,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "cpu": {
+        "capacity_bytes": 5898240000,
+        "reserved_bytes": 5898240000,
+        "in_use_bytes": 0,
+        "free_bytes": 5898240000,
+        "peak_bytes": 0,
+        "largest_free_bytes": 5898240000,
+        "pending_bytes": 0,
+        "active_leases": 0
+      }
+    },
+    {
+      "name": "long-constrained-packed",
+      "k": 4,
+      "r": 0.1,
+      "temperature": 0.0,
+      "seconds": 6.333185923984274,
+      "input_lengths": [
+        20423
+      ],
+      "output_lengths": [
+        12
+      ],
+      "forwards": 53,
+      "verify_forwards": 3,
+      "migrations": 2,
+      "restores": 2,
+      "admission_waits": 0,
+      "max_actual_batch": 1,
+      "mixed_prefill_draft_forwards": 0,
+      "mixed_verify_draft_forwards": 0,
+      "mixed_verify_prefill_forwards": 0,
+      "verify_model_forwards": 3,
+      "max_verify_batch": 1,
+      "verify_batch_histogram": {
+        "1": 3
+      },
+      "d2h_bytes": 5421957120,
+      "h2d_bytes": 5421957120,
+      "full_bytes_returned": 3012231168,
+      "attention_grid": {
+        "forwards": 53,
+        "minimum_blocks": 128,
+        "maximum_blocks": 5120,
+        "estimated_idle_ratio_sum": 4.702311036057167,
+        "workspace_peak_bytes": 88801280
+      },
+      "accepted_draft_tokens": 8,
+      "proposed_draft_tokens": 10,
+      "gpu": {
+        "capacity_bytes": 3538944000,
+        "reserved_bytes": 3538944000,
+        "in_use_bytes": 0,
+        "free_bytes": 3538944000,
+        "peak_bytes": 3314958336,
+        "largest_free_bytes": 3538944000,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "cpu": {
+        "capacity_bytes": 5898240000,
+        "reserved_bytes": 5898240000,
+        "in_use_bytes": 0,
+        "free_bytes": 5898240000,
+        "peak_bytes": 5423431680,
+        "largest_free_bytes": 5898240000,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "greedy_numerical_differences": [
+        {
+          "request_id": 0,
+          "position": 3,
+          "dense_token": 279,
+          "packed_token": 26668,
+          "dense_top2_ids": [
+            26668,
+            279
+          ],
+          "dense_top2_logits": [
+            30.375,
+            30.375
+          ],
+          "packed_logits_for_dense_top2": [
+            30.375,
+            30.25
+          ],
+          "max_abs_logit_error": 0.375,
+          "rmse": 0.058004580438137054,
+          "relative_rmse": 0.011533180251717567,
+          "cosine": 0.9999679923057556,
+          "full_spec_same_prefix": true,
+          "full_spec_token": 26668,
+          "full_spec_logits_for_dense_top2": [
+            30.375,
+            30.25
+          ],
+          "full_spec_vs_ar_max_error": 0.375,
+          "packed_vs_full_spec_max_error": 0.0
+        }
+      ],
+      "greedy_matches_dense_ar": false
+    },
+    {
+      "name": "long-constrained-full-self-spec",
+      "k": 4,
+      "r": 0.1,
+      "temperature": 0.0,
+      "seconds": 5.463985274080187,
+      "input_lengths": [
+        20423
+      ],
+      "output_lengths": [
+        12
+      ],
+      "forwards": 53,
+      "verify_forwards": 3,
+      "migrations": 0,
+      "restores": 0,
+      "admission_waits": 0,
+      "max_actual_batch": 1,
+      "mixed_prefill_draft_forwards": 0,
+      "mixed_verify_draft_forwards": 0,
+      "mixed_verify_prefill_forwards": 0,
+      "verify_model_forwards": 3,
+      "max_verify_batch": 1,
+      "verify_batch_histogram": {
+        "1": 3
+      },
+      "d2h_bytes": 0,
+      "h2d_bytes": 0,
+      "full_bytes_returned": 0,
+      "attention_grid": {
+        "forwards": 53,
+        "minimum_blocks": 216,
+        "maximum_blocks": 5120,
+        "estimated_idle_ratio_sum": 2.2578665916127223,
+        "workspace_peak_bytes": 88801280
+      },
+      "accepted_draft_tokens": 8,
+      "proposed_draft_tokens": 10,
+      "gpu": {
+        "capacity_bytes": 3538944000,
+        "reserved_bytes": 3538944000,
+        "in_use_bytes": 0,
+        "free_bytes": 3538944000,
+        "peak_bytes": 3013263360,
+        "largest_free_bytes": 3538944000,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "cpu": {
+        "capacity_bytes": 5898240000,
+        "reserved_bytes": 5898240000,
+        "in_use_bytes": 0,
+        "free_bytes": 5898240000,
+        "peak_bytes": 0,
+        "largest_free_bytes": 5898240000,
+        "pending_bytes": 0,
+        "active_leases": 0
+      },
+      "greedy_matches_dense_ar": false
+    }
+  ],
+  "coordinated_failure_passed": true
+}

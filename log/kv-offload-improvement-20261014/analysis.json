@@ -1,0 +1,1003 @@
+{
+  "config": {
+    "config": {
+      "model": "/data/models/Qwen3-8B",
+      "data": "eval/benchmarks/data/aime24/test.jsonl",
+      "output": "log/kv-offload-improvement-20261014/aime-final",
+      "samples": 8,
+      "output_length": 512,
+      "batch": 4,
+      "k": 4,
+      "r": 0.1,
+      "minimum": 128,
+      "chunk_size": 256,
+      "repetitions": 3,
+      "modes": [
+        "original_sparse",
+        "resident_sparse",
+        "packed_offload"
+      ],
+      "seed": 330,
+      "no_thinking": false,
+      "gpu_mib": 2048,
+      "cpu_mib": 2048,
+      "diagnostic_rounds": 8,
+      "diagnostic_min_history": 256
+    },
+    "device": "NVIDIA A100-PCIE-40GB",
+    "torch_version": "2.8.0+cu128",
+    "dtype": "bfloat16",
+    "temperature": 0,
+    "cuda_graph": false,
+    "async_cpu": false,
+    "tp": 1,
+    "eos_token_ids": [
+      151643,
+      151645
+    ],
+    "source_sha256": "adb64f401d3d5a613577a6e7d72f123484b81e18f6523397f8450dd1058d34dd",
+    "timing": "Only scheduler.run and terminal GPU completion; weights/arenas/warmup excluded",
+    "resident_control": "Cold CPU views mapped to a reserved GPU shadow; both transfers become D2D",
+    "comparison_limit": "Original scheduler/attention differs; full self-spec uses full-context drafting. Only resident vs offload isolates CPU transfers with identical sparse math.",
+    "reserved_gpu_bytes_after_setup": 24169007104,
+    "experimental_shadow_bytes": 2147483648,
+    "token_kv_bytes": 147456
+  },
+  "request_ids": [
+    89,
+    79,
+    62,
+    61,
+    72,
+    77,
+    60,
+    70
+  ],
+  "mean_input_tokens": 109,
+  "summary": {
+    "original_sparse": {
+      "seconds": {
+        "count": 3,
+        "total": 99.10716431192122,
+        "mean": 33.035721437307075,
+        "median": 33.041735703125596,
+        "minimum": 32.89279083185829,
+        "maximum": 33.172637776937336,
+        "p95": 33.172637776937336
+      },
+      "tokens_per_second": {
+        "count": 3,
+        "total": 374.1148981602389,
+        "mean": 124.70496605341297,
+        "median": 124.78158039409483,
+        "minimum": 124.10830961601336,
+        "maximum": 125.22500815013073,
+        "p95": 125.22500815013073
+      }
+    },
+    "resident_sparse": {
+      "seconds": {
+        "count": 3,
+        "total": 118.13294817018323,
+        "mean": 39.37764939006107,
+        "median": 39.365791770862415,
+        "minimum": 39.36454597720876,
+        "maximum": 39.40261042211205,
+        "p95": 39.40261042211205
+      },
+      "tokens_per_second": {
+        "count": 3,
+        "total": 312.05525622662685,
+        "mean": 104.01841874220895,
+        "median": 104.04972987312699,
+        "minimum": 103.95250355548518,
+        "maximum": 104.05302279801467,
+        "p95": 104.05302279801467
+      }
+    },
+    "packed_offload": {
+      "seconds": {
+        "count": 3,
+        "total": 132.4679381242022,
+        "mean": 44.155979374734066,
+        "median": 44.15380497602746,
+        "minimum": 44.137917657149956,
+        "maximum": 44.17621549102478,
+        "p95": 44.17621549102478
+      },
+      "tokens_per_second": {
+        "count": 3,
+        "total": 278.2862418504135,
+        "mean": 92.7620806168045,
+        "median": 92.76663703669145,
+        "minimum": 92.7195766878713,
+        "maximum": 92.80002812585074,
+        "p95": 92.80002812585074
+      }
+    },
+    "comparison": {
+      "offload_vs_resident_time_percent": 12.162877944980167,
+      "offload_vs_original_time_percent": 33.630404203767995,
+      "offload_minus_resident_seconds": 4.7880132051650435
+    }
+  },
+  "previous_summary": {
+    "original_sparse": {
+      "seconds": {
+        "count": 3,
+        "total": 99.56698035495356,
+        "mean": 33.188993451651186,
+        "median": 33.2675531739369,
+        "minimum": 32.975784056819975,
+        "maximum": 33.32364312419668,
+        "p95": 33.32364312419668
+      },
+      "tokens_per_second": {
+        "count": 3,
+        "total": 372.44982987449373,
+        "mean": 124.14994329149792,
+        "median": 123.81433580233923,
+        "minimum": 123.75597663886624,
+        "maximum": 124.87951743328829,
+        "p95": 124.87951743328829
+      }
+    },
+    "full_self_spec": {
+      "seconds": {
+        "count": 3,
+        "total": 150.12741664564237,
+        "mean": 50.042472215214126,
+        "median": 50.06212365697138,
+        "minimum": 49.98178449785337,
+        "maximum": 50.08350849081762,
+        "p95": 50.08350849081762
+      },
+      "tokens_per_second": {
+        "count": 3,
+        "total": 245.55160588265528,
+        "mean": 81.85053529421842,
+        "median": 81.81834290662604,
+        "minimum": 81.78340782077929,
+        "maximum": 81.94985515524994,
+        "p95": 81.94985515524994
+      }
+    },
+    "resident_sparse": {
+      "seconds": {
+        "count": 3,
+        "total": 164.22358090919442,
+        "mean": 54.741193636398144,
+        "median": 54.736838557058945,
+        "minimum": 54.678933755960315,
+        "maximum": 54.807808596175164,
+        "p95": 54.807808596175164
+      },
+      "tokens_per_second": {
+        "count": 3,
+        "total": 224.4746702138749,
+        "mean": 74.82489007129163,
+        "median": 74.83077408152162,
+        "minimum": 74.73387652075994,
+        "maximum": 74.91001961159333,
+        "p95": 74.91001961159333
+      }
+    },
+    "packed_offload": {
+      "seconds": {
+        "count": 3,
+        "total": 178.2691395082511,
+        "mean": 59.42304650275037,
+        "median": 59.431662735994905,
+        "minimum": 59.38914627209306,
+        "maximum": 59.44833050016314,
+        "p95": 59.44833050016314
+      },
+      "tokens_per_second": {
+        "count": 3,
+        "total": 206.78849174469903,
+        "mean": 68.929497248233,
+        "median": 68.91949192461765,
+        "minimum": 68.90016869336237,
+        "maximum": 68.96883112671901,
+        "p95": 68.96883112671901
+      }
+    },
+    "comparison": {
+      "offload_vs_resident_time_percent": 8.577083190586476,
+      "offload_minus_resident_seconds": 4.69482417893596,
+      "offload_vs_original_time_percent": 78.64753210210837,
+      "offload_vs_full_self_spec_time_percent": 18.71582424913525
+    }
+  },
+  "offload_time_reduction_percent": 25.706596545740556,
+  "throughput_gain_percent": 34.60145228313232,
+  "paired_resident_offload_equal": true,
+  "metrics": {
+    "forwards": 1118,
+    "verify_forwards": 873,
+    "migrations": 865,
+    "restores": 865,
+    "admission_waits": 0,
+    "max_actual_batch": 4,
+    "mixed_prefill_draft_forwards": 4,
+    "mixed_verify_draft_forwards": 343,
+    "mixed_verify_prefill_forwards": 2,
+    "verify_model_forwards": 450,
+    "max_verify_batch": 4,
+    "verify_batch_histogram": {
+      "4": 105,
+      "1": 241,
+      "3": 4,
+      "2": 100
+    },
+    "d2h_bytes": 31140790272,
+    "h2d_bytes": 31140790272,
+    "full_bytes_returned": 134479872,
+    "attention_grid": {
+      "forwards": 1118,
+      "minimum_blocks": 16,
+      "maximum_blocks": 456,
+      "estimated_idle_ratio_sum": 723.1481481481479,
+      "workspace_peak_bytes": 10826752
+    },
+    "accepted_draft_tokens": 3215,
+    "proposed_draft_tokens": 3475,
+    "gpu": {
+      "capacity_bytes": 2147483648,
+      "reserved_bytes": 2147483648,
+      "in_use_bytes": 0,
+      "free_bytes": 2147483648,
+      "peak_bytes": 373506048,
+      "largest_free_bytes": 2147483648,
+      "pending_bytes": 0,
+      "active_leases": 0
+    },
+    "cpu": {
+      "capacity_bytes": 2147483648,
+      "reserved_bytes": 2147483648,
+      "in_use_bytes": 0,
+      "free_bytes": 2147483648,
+      "peak_bytes": 369672192,
+      "largest_free_bytes": 2147483648,
+      "pending_bytes": 0,
+      "active_leases": 0
+    },
+    "query_phases": {
+      "prefill_query_tokens": 872,
+      "draft_query_tokens": 3475,
+      "verify_query_tokens": 4348
+    },
+    "actual_batch_histogram": {
+      "4": 1050,
+      "3": 27,
+      "2": 34,
+      "1": 7
+    },
+    "selection_history": {
+      "count": 865,
+      "total": 321268,
+      "mean": 371.4080924855491,
+      "median": 376,
+      "minimum": 76,
+      "maximum": 665,
+      "p95": 597
+    },
+    "selection_hot": {
+      "count": 865,
+      "total": 110081,
+      "mean": 127.26127167630058,
+      "median": 128,
+      "minimum": 76,
+      "maximum": 128,
+      "p95": 128
+    },
+    "effective_hot_ratio": {
+      "count": 865,
+      "total": 365.4442239328909,
+      "mean": 0.42247887159871783,
+      "median": 0.3404255319148936,
+      "minimum": 0.1924812030075188,
+      "maximum": 1.0,
+      "p95": 0.9481481481481482
+    }
+  },
+  "effective_hot_ratio_weighted": 0.3426453926316969,
+  "mean_actual_batch": 3.896243291592129,
+  "validation": {
+    "validation-complete-tp1": {
+      "status": "passed_with_numerical_difference",
+      "tp": 1,
+      "test_count": 12,
+      "coordinated_failure_passed": true,
+      "tests": [
+        {
+          "name": "dense-ar",
+          "max_actual_batch": 3,
+          "migrations": 0,
+          "gpu": {
+            "capacity_bytes": 536870912,
+            "reserved_bytes": 536870912,
+            "in_use_bytes": 0,
+            "free_bytes": 536870912,
+            "peak_bytes": 145539072,
+            "largest_free_bytes": 536870912,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 1073741824,
+            "reserved_bytes": 1073741824,
+            "in_use_bytes": 0,
+            "free_bytes": 1073741824,
+            "peak_bytes": 0,
+            "largest_free_bytes": 1073741824,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "full-self-spec-k14",
+          "greedy_matches_dense_ar": true,
+          "max_actual_batch": 3,
+          "migrations": 0,
+          "gpu": {
+            "capacity_bytes": 536870912,
+            "reserved_bytes": 536870912,
+            "in_use_bytes": 0,
+            "free_bytes": 536870912,
+            "peak_bytes": 145539072,
+            "largest_free_bytes": 536870912,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 1073741824,
+            "reserved_bytes": 1073741824,
+            "in_use_bytes": 0,
+            "free_bytes": 1073741824,
+            "peak_bytes": 0,
+            "largest_free_bytes": 1073741824,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "packed-k4-r0.05",
+          "greedy_matches_dense_ar": true,
+          "max_actual_batch": 3,
+          "migrations": 19,
+          "gpu": {
+            "capacity_bytes": 536870912,
+            "reserved_bytes": 536870912,
+            "in_use_bytes": 0,
+            "free_bytes": 536870912,
+            "peak_bytes": 137428992,
+            "largest_free_bytes": 536870912,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 1073741824,
+            "reserved_bytes": 1073741824,
+            "in_use_bytes": 0,
+            "free_bytes": 1073741824,
+            "peak_bytes": 227819520,
+            "largest_free_bytes": 1073741824,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "packed-k4-r0.25",
+          "greedy_matches_dense_ar": true,
+          "max_actual_batch": 3,
+          "migrations": 19,
+          "gpu": {
+            "capacity_bytes": 536870912,
+            "reserved_bytes": 536870912,
+            "in_use_bytes": 0,
+            "free_bytes": 536870912,
+            "peak_bytes": 144654336,
+            "largest_free_bytes": 536870912,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 1073741824,
+            "reserved_bytes": 1073741824,
+            "in_use_bytes": 0,
+            "free_bytes": 1073741824,
+            "peak_bytes": 181370880,
+            "largest_free_bytes": 1073741824,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "packed-k14-r0.1",
+          "greedy_matches_dense_ar": true,
+          "max_actual_batch": 3,
+          "migrations": 6,
+          "gpu": {
+            "capacity_bytes": 536870912,
+            "reserved_bytes": 536870912,
+            "in_use_bytes": 0,
+            "free_bytes": 536870912,
+            "peak_bytes": 142589952,
+            "largest_free_bytes": 536870912,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 1073741824,
+            "reserved_bytes": 1073741824,
+            "in_use_bytes": 0,
+            "free_bytes": 1073741824,
+            "peak_bytes": 174882816,
+            "largest_free_bytes": 1073741824,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "stochastic",
+          "max_actual_batch": 2,
+          "migrations": 12,
+          "gpu": {
+            "capacity_bytes": 536870912,
+            "reserved_bytes": 536870912,
+            "in_use_bytes": 0,
+            "free_bytes": 536870912,
+            "peak_bytes": 45563904,
+            "largest_free_bytes": 536870912,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 1073741824,
+            "reserved_bytes": 1073741824,
+            "in_use_bytes": 0,
+            "free_bytes": 1073741824,
+            "peak_bytes": 76677120,
+            "largest_free_bytes": 1073741824,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "pressure",
+          "max_actual_batch": 4,
+          "migrations": 16,
+          "gpu": {
+            "capacity_bytes": 147456000,
+            "reserved_bytes": 147456000,
+            "in_use_bytes": 0,
+            "free_bytes": 147456000,
+            "peak_bytes": 126074880,
+            "largest_free_bytes": 147456000,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 1073741824,
+            "reserved_bytes": 1073741824,
+            "in_use_bytes": 0,
+            "free_bytes": 1073741824,
+            "peak_bytes": 180633600,
+            "largest_free_bytes": 1073741824,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "long-dense-ar",
+          "max_actual_batch": 1,
+          "migrations": 0,
+          "gpu": {
+            "capacity_bytes": 2147483648,
+            "reserved_bytes": 2147483648,
+            "in_use_bytes": 0,
+            "free_bytes": 2147483648,
+            "peak_bytes": 712949760,
+            "largest_free_bytes": 2147483648,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 2147483648,
+            "reserved_bytes": 2147483648,
+            "in_use_bytes": 0,
+            "free_bytes": 2147483648,
+            "peak_bytes": 0,
+            "largest_free_bytes": 2147483648,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "long-packed",
+          "greedy_matches_dense_ar": true,
+          "max_actual_batch": 1,
+          "migrations": 2,
+          "gpu": {
+            "capacity_bytes": 2147483648,
+            "reserved_bytes": 2147483648,
+            "in_use_bytes": 0,
+            "free_bytes": 2147483648,
+            "peak_bytes": 784908288,
+            "largest_free_bytes": 2147483648,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 2147483648,
+            "reserved_bytes": 2147483648,
+            "in_use_bytes": 0,
+            "free_bytes": 2147483648,
+            "peak_bytes": 1282867200,
+            "largest_free_bytes": 2147483648,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "long-constrained-dense-ar",
+          "max_actual_batch": 1,
+          "migrations": 0,
+          "gpu": {
+            "capacity_bytes": 3538944000,
+            "reserved_bytes": 3538944000,
+            "in_use_bytes": 0,
+            "free_bytes": 3538944000,
+            "peak_bytes": 3013263360,
+            "largest_free_bytes": 3538944000,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 5898240000,
+            "reserved_bytes": 5898240000,
+            "in_use_bytes": 0,
+            "free_bytes": 5898240000,
+            "peak_bytes": 0,
+            "largest_free_bytes": 5898240000,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "long-constrained-packed",
+          "greedy_matches_dense_ar": false,
+          "greedy_numerical_differences": [
+            {
+              "request_id": 0,
+              "position": 3,
+              "dense_token": 279,
+              "packed_token": 26668,
+              "dense_top2_ids": [
+                26668,
+                279
+              ],
+              "dense_top2_logits": [
+                30.375,
+                30.375
+              ],
+              "packed_logits_for_dense_top2": [
+                30.375,
+                30.25
+              ],
+              "max_abs_logit_error": 0.375,
+              "rmse": 0.058004580438137054,
+              "relative_rmse": 0.011533180251717567,
+              "cosine": 0.9999679923057556,
+              "full_spec_same_prefix": true,
+              "full_spec_token": 26668,
+              "full_spec_logits_for_dense_top2": [
+                30.375,
+                30.25
+              ],
+              "full_spec_vs_ar_max_error": 0.375,
+              "packed_vs_full_spec_max_error": 0.0
+            }
+          ],
+          "max_actual_batch": 1,
+          "migrations": 2,
+          "gpu": {
+            "capacity_bytes": 3538944000,
+            "reserved_bytes": 3538944000,
+            "in_use_bytes": 0,
+            "free_bytes": 3538944000,
+            "peak_bytes": 3314958336,
+            "largest_free_bytes": 3538944000,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 5898240000,
+            "reserved_bytes": 5898240000,
+            "in_use_bytes": 0,
+            "free_bytes": 5898240000,
+            "peak_bytes": 5423431680,
+            "largest_free_bytes": 5898240000,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "long-constrained-full-self-spec",
+          "greedy_matches_dense_ar": false,
+          "max_actual_batch": 1,
+          "migrations": 0,
+          "gpu": {
+            "capacity_bytes": 3538944000,
+            "reserved_bytes": 3538944000,
+            "in_use_bytes": 0,
+            "free_bytes": 3538944000,
+            "peak_bytes": 3013263360,
+            "largest_free_bytes": 3538944000,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 5898240000,
+            "reserved_bytes": 5898240000,
+            "in_use_bytes": 0,
+            "free_bytes": 5898240000,
+            "peak_bytes": 0,
+            "largest_free_bytes": 5898240000,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        }
+      ]
+    },
+    "validation-allocator-tp2": {
+      "status": "passed_with_numerical_difference",
+      "tp": 2,
+      "test_count": 11,
+      "coordinated_failure_passed": true,
+      "tests": [
+        {
+          "name": "dense-ar",
+          "max_actual_batch": 3,
+          "migrations": 0,
+          "gpu": {
+            "capacity_bytes": 536870912,
+            "reserved_bytes": 536870912,
+            "in_use_bytes": 0,
+            "free_bytes": 536870912,
+            "peak_bytes": 72769536,
+            "largest_free_bytes": 536870912,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 1073741824,
+            "reserved_bytes": 1073741824,
+            "in_use_bytes": 0,
+            "free_bytes": 1073741824,
+            "peak_bytes": 0,
+            "largest_free_bytes": 1073741824,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "full-self-spec-k14",
+          "greedy_matches_dense_ar": true,
+          "max_actual_batch": 3,
+          "migrations": 0,
+          "gpu": {
+            "capacity_bytes": 536870912,
+            "reserved_bytes": 536870912,
+            "in_use_bytes": 0,
+            "free_bytes": 536870912,
+            "peak_bytes": 72769536,
+            "largest_free_bytes": 536870912,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 1073741824,
+            "reserved_bytes": 1073741824,
+            "in_use_bytes": 0,
+            "free_bytes": 1073741824,
+            "peak_bytes": 0,
+            "largest_free_bytes": 1073741824,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "packed-k4-r0.05",
+          "greedy_matches_dense_ar": true,
+          "max_actual_batch": 3,
+          "migrations": 19,
+          "gpu": {
+            "capacity_bytes": 536870912,
+            "reserved_bytes": 536870912,
+            "in_use_bytes": 0,
+            "free_bytes": 536870912,
+            "peak_bytes": 68714496,
+            "largest_free_bytes": 536870912,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 1073741824,
+            "reserved_bytes": 1073741824,
+            "in_use_bytes": 0,
+            "free_bytes": 1073741824,
+            "peak_bytes": 113909760,
+            "largest_free_bytes": 1073741824,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "packed-k4-r0.25",
+          "greedy_matches_dense_ar": false,
+          "greedy_numerical_differences": [
+            {
+              "request_id": 1,
+              "position": 7,
+              "dense_token": 1550,
+              "packed_token": 4937,
+              "dense_top2_ids": [
+                4937,
+                1550
+              ],
+              "dense_top2_logits": [
+                35.0,
+                35.0
+              ],
+              "packed_logits_for_dense_top2": [
+                35.25,
+                35.0
+              ],
+              "max_abs_logit_error": 0.28125,
+              "rmse": 0.06818933039903641,
+              "relative_rmse": 0.011929242871701717,
+              "cosine": 0.9999552965164185,
+              "full_spec_token": 1550,
+              "full_spec_logits_for_dense_top2": [
+                35.0,
+                35.0
+              ],
+              "full_spec_vs_ar_max_error": 0.25,
+              "packed_vs_full_spec_max_error": 0.25
+            }
+          ],
+          "max_actual_batch": 3,
+          "migrations": 19,
+          "gpu": {
+            "capacity_bytes": 536870912,
+            "reserved_bytes": 536870912,
+            "in_use_bytes": 0,
+            "free_bytes": 536870912,
+            "peak_bytes": 72105984,
+            "largest_free_bytes": 536870912,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 1073741824,
+            "reserved_bytes": 1073741824,
+            "in_use_bytes": 0,
+            "free_bytes": 1073741824,
+            "peak_bytes": 90685440,
+            "largest_free_bytes": 1073741824,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "packed-k14-r0.1",
+          "greedy_matches_dense_ar": true,
+          "max_actual_batch": 3,
+          "migrations": 7,
+          "gpu": {
+            "capacity_bytes": 536870912,
+            "reserved_bytes": 536870912,
+            "in_use_bytes": 0,
+            "free_bytes": 536870912,
+            "peak_bytes": 71294976,
+            "largest_free_bytes": 536870912,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 1073741824,
+            "reserved_bytes": 1073741824,
+            "in_use_bytes": 0,
+            "free_bytes": 1073741824,
+            "peak_bytes": 87441408,
+            "largest_free_bytes": 1073741824,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "stochastic",
+          "max_actual_batch": 2,
+          "migrations": 12,
+          "gpu": {
+            "capacity_bytes": 536870912,
+            "reserved_bytes": 536870912,
+            "in_use_bytes": 0,
+            "free_bytes": 536870912,
+            "peak_bytes": 22781952,
+            "largest_free_bytes": 536870912,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 1073741824,
+            "reserved_bytes": 1073741824,
+            "in_use_bytes": 0,
+            "free_bytes": 1073741824,
+            "peak_bytes": 38338560,
+            "largest_free_bytes": 1073741824,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "pressure",
+          "max_actual_batch": 4,
+          "migrations": 16,
+          "gpu": {
+            "capacity_bytes": 73728000,
+            "reserved_bytes": 73728000,
+            "in_use_bytes": 0,
+            "free_bytes": 73728000,
+            "peak_bytes": 63037440,
+            "largest_free_bytes": 73728000,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 1073741824,
+            "reserved_bytes": 1073741824,
+            "in_use_bytes": 0,
+            "free_bytes": 1073741824,
+            "peak_bytes": 90316800,
+            "largest_free_bytes": 1073741824,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "long-dense-ar",
+          "max_actual_batch": 1,
+          "migrations": 0,
+          "gpu": {
+            "capacity_bytes": 2147483648,
+            "reserved_bytes": 2147483648,
+            "in_use_bytes": 0,
+            "free_bytes": 2147483648,
+            "peak_bytes": 356474880,
+            "largest_free_bytes": 2147483648,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 2147483648,
+            "reserved_bytes": 2147483648,
+            "in_use_bytes": 0,
+            "free_bytes": 2147483648,
+            "peak_bytes": 0,
+            "largest_free_bytes": 2147483648,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "long-packed",
+          "greedy_matches_dense_ar": true,
+          "max_actual_batch": 1,
+          "migrations": 2,
+          "gpu": {
+            "capacity_bytes": 2147483648,
+            "reserved_bytes": 2147483648,
+            "in_use_bytes": 0,
+            "free_bytes": 2147483648,
+            "peak_bytes": 392454144,
+            "largest_free_bytes": 2147483648,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 2147483648,
+            "reserved_bytes": 2147483648,
+            "in_use_bytes": 0,
+            "free_bytes": 2147483648,
+            "peak_bytes": 641433600,
+            "largest_free_bytes": 2147483648,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "long-constrained-dense-ar",
+          "max_actual_batch": 1,
+          "migrations": 0,
+          "gpu": {
+            "capacity_bytes": 1769472000,
+            "reserved_bytes": 1769472000,
+            "in_use_bytes": 0,
+            "free_bytes": 1769472000,
+            "peak_bytes": 1506631680,
+            "largest_free_bytes": 1769472000,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 2949120000,
+            "reserved_bytes": 2949120000,
+            "in_use_bytes": 0,
+            "free_bytes": 2949120000,
+            "peak_bytes": 0,
+            "largest_free_bytes": 2949120000,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        },
+        {
+          "name": "long-constrained-packed",
+          "greedy_matches_dense_ar": true,
+          "max_actual_batch": 1,
+          "migrations": 2,
+          "gpu": {
+            "capacity_bytes": 1769472000,
+            "reserved_bytes": 1769472000,
+            "in_use_bytes": 0,
+            "free_bytes": 1769472000,
+            "peak_bytes": 1657626624,
+            "largest_free_bytes": 1769472000,
+            "pending_bytes": 0,
+            "active_leases": 0
+          },
+          "cpu": {
+            "capacity_bytes": 2949120000,
+            "reserved_bytes": 2949120000,
+            "in_use_bytes": 0,
+            "free_bytes": 2949120000,
+            "peak_bytes": 2711715840,
+            "largest_free_bytes": 2949120000,
+            "pending_bytes": 0,
+            "active_leases": 0
+          }
+        }
+      ]
+    }
+  },
+  "component_tests": {
+    "total": 73,
+    "passed": 71,
+    "skipped": 2
+  },
+  "kv_memcheck": {
+    "tests": 27,
+    "errors": 0,
+    "scope": "KV-specific modules; excludes actual FlashInfer RoPE because an independent standalone call reports CUDA API error 400 under sanitizer"
+  },
+  "public_entry_passed": true,
+  "changed_files": [
+    "serve/attention/README_packed_kv.md",
+    "serve/attention/batched_kv_attention.py",
+    "serve/attention/full_forward.py",
+    "serve/attention/kv_buffer_pool.py",
+    "serve/attention/kv_partition.py",
+    "serve/attention/packed_batch.py",
+    "serve/attention/packed_forward.py",
+    "serve/scheduler/packed_scheduler.py",
+    "serve/tests/bench_aime_kv_overhead.py",
+    "serve/tests/test_batched_kv_attention.py",
+    "serve/tests/test_kv_buffer_pool.py",
+    "serve/tests/test_kv_partition.py",
+    "serve/tests/test_packed_batch.py",
+    "serve/tests/test_packed_scheduler.py",
+    "serve/tests/validate_packed_serving.py"
+  ]
+}

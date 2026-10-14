@@ -1,0 +1,20 @@
+{
+  "capture": "After final validation; production and benchmark files were unchanged during the final benchmark. Validation helper and documentation updates followed timing.",
+  "files": {
+    "serve/attention/README_packed_kv.md": "e834affb7d736e57795f55f6e89433b04edeca5d13123ad6c1d74730f38a9f41",
+    "serve/attention/batched_kv_attention.py": "f15610600f13a3364096b0aae1cbbd2303470cc9cd1a4a07f3a9638feb1a0635",
+    "serve/attention/full_forward.py": "09593c896c2a30371114a2b829de14f76dbe303d2a5027125ac0f6b9bdec3be7",
+    "serve/attention/kv_buffer_pool.py": "1f09d158dfee1118499b2849d1668a9950069f18809b85bddd603681614084c3",
+    "serve/attention/kv_partition.py": "bf1b5266c1413086a57bb74a36df9173b14d8d13470e58bdd7ec685582818288",
+    "serve/attention/packed_batch.py": "36bd11b26640eab9331cd551d20957ce01a665decc883eb17fa19cb34b9cfb20",
+    "serve/attention/packed_forward.py": "ac1fd9037b68a881877462c09b0345aa4007a05d08dd97ce2a868164f5f988fc",
+    "serve/scheduler/packed_scheduler.py": "51cda0ccb4cb35c805f3e49f8167ec0bec9e3c9226976fde6f998e4e2e03c3ae",
+    "serve/tests/bench_aime_kv_overhead.py": "adb64f401d3d5a613577a6e7d72f123484b81e18f6523397f8450dd1058d34dd",
+    "serve/tests/test_batched_kv_attention.py": "b25b852f6a1d66c8125f00ced6d7e0c493fe77cde55129a172e0e9b9caa0a407",
+    "serve/tests/test_kv_buffer_pool.py": "a363712b2da0c774cabc98cfeab7552e240f35cb1b3e04ca07f7e2c9705f41e8",
+    "serve/tests/test_kv_partition.py": "edb8fcdb040528c10cea1e8ef1d8529fbe5b62e6dae0cb592f6b4b8fe56b5d0c",
+    "serve/tests/test_packed_batch.py": "2accf613d7ac53b48204040672752f404fece79d01a4f030134b0ff32ec5f95e",
+    "serve/tests/test_packed_scheduler.py": "49feceea2f872dd21d18cd533e66d478cdf8123b00a0d65ae9d3f1c9cb7dd44d",
+    "serve/tests/validate_packed_serving.py": "df2aa29fc884ccd2e03d4188f66ce6ba6495bceaab89fce9e525c6071d087136"
+  }
+}
