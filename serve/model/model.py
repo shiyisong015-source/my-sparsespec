@@ -41,6 +41,7 @@ class KVPool:
         dtype: torch.dtype = torch.float16,
         page_size: int = 1,
         vanilla_backend: bool = False,
+        allocate_legacy_cpu: bool = True,
     ):
         self._free_gpu = set(range(capacity))
         self.num_layers = config.num_layers
@@ -66,7 +67,9 @@ class KVPool:
         )
 
         # NOTE(Yilong): This could be super slow on certain machines.
-        self._MAX_CPU_CAPACITY = math.ceil(self.capacity * 1.5)
+        # Compact KV owns its pinned cold backing separately. Keep the original
+        # allocator/layout and legacy behavior for all existing entry points.
+        self._MAX_CPU_CAPACITY = math.ceil(self.capacity * 1.5) if allocate_legacy_cpu else 0
         self._free_cpu = array.array("i", range(self._MAX_CPU_CAPACITY))
         self._physical_mem_cpu = torch.empty(
             (

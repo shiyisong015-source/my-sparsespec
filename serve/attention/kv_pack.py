@@ -180,3 +180,96 @@ def pack_selected_kv(
             TOKENS=tokens_per_tile, WIDTH=triton.next_power_of_2(2 * dim),
             num_warps=num_warps,
         )
+
+
+@triton.jit
+def _scatter_kv_pages(
+    source, selection, destination, destination_pages,
+    count, heads: tl.constexpr, dim: tl.constexpr,
+    sl, sp: tl.constexpr, skv: tl.constexpr, sh: tl.constexpr,
+    il, ih, dl, dp: tl.constexpr, dkv: tl.constexpr, dh: tl.constexpr,
+    RESTORE: tl.constexpr, TOKENS: tl.constexpr, WIDTH: tl.constexpr,
+):
+    layer = tl.program_id(1).to(tl.int64)
+    head = tl.program_id(2).to(tl.int64)
+    j = tl.program_id(0) * TOKENS + tl.arange(0, TOKENS)
+    lane = tl.arange(0, WIDTH)
+    if RESTORE:
+        src_page = j.to(tl.int64)
+    else:
+        src_page = tl.load(selection + layer * il + head * ih + j,
+                           mask=j < count, other=0).to(tl.int64)
+    dst_page = tl.load(destination_pages + j, mask=j < count, other=0).to(tl.int64)
+    kv, channel = lane // dim, lane % dim
+    mask = (j[:, None] < count) & (lane[None, :] < 2 * dim)
+    value = tl.load(source + layer * sl + src_page[:, None] * sp
+                    + kv[None, :] * skv + head * sh + channel[None, :], mask=mask, other=0)
+    tl.store(destination + layer * dl + dst_page[:, None] * dp
+             + kv[None, :] * dkv + head * dh + channel[None, :], value, mask=mask)
+
+
+def _pool_copy(source, destination, destination_page_ids, selection=None):
+    """Internal: callers validate ownership before submitting this stream work."""
+    if (source.ndim != 6 or destination.ndim != 6 or source.shape[2:4] != (2, 1)
+            or source.shape[0] != destination.shape[0] or source.shape[2:] != destination.shape[2:]
+            or not source.is_contiguous() or not destination.is_contiguous()
+            or source.dtype != destination.dtype
+            or source.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or destination.device.type != "cuda"):
+        raise ValueError("Expected matching contiguous original-layout KV and a CUDA pool")
+    pages = tuple(destination_page_ids)
+    if (len(set(pages)) != len(pages)
+            or any(type(p) is not int or not 0 <= p < destination.shape[1] for p in pages)):
+        raise ValueError("Destination pages must be unique valid pool pages")
+    restore = selection is None
+    if restore:
+        if source.device.type != "cpu" or (source.numel() and not source.is_pinned()):
+            raise ValueError("Restore requires mapped pinned CPU backing")
+        if source.shape[1] != len(pages):
+            raise ValueError("Restore must cover all cold slots")
+        selection = destination  # Unused pointer; erased by constexpr dispatch.
+        il = ih = 0
+    else:
+        if (source.device != destination.device or selection.device != source.device
+                or selection.dtype not in (torch.int32, torch.int64) or selection.ndim != 3
+                or selection.shape[:2] != (source.shape[0], source.shape[4])
+                or selection.shape[-1] < len(pages) or selection.stride(-1) != 1):
+            raise ValueError("Selection must be CUDA [layers, local heads, count]")
+        il, ih = selection.stride()[:2]
+    if not pages:
+        return
+    indices = torch.tensor(pages, device=destination.device, dtype=torch.int32)
+    with torch.cuda.device(destination.device):
+        _scatter_kv_pages[(triton.cdiv(len(pages), 8), source.shape[0], source.shape[4])](
+            source, selection, destination, indices, len(pages), source.shape[4], source.shape[5],
+            source.stride(0), source.stride(1), source.stride(2), source.stride(4), il, ih,
+            destination.stride(0), destination.stride(1), destination.stride(2), destination.stride(4),
+            RESTORE=restore, TOKENS=8, WIDTH=triton.next_power_of_2(2 * source.shape[5]),
+            num_warps=8,
+        )
+
+
+def gather_to_pool(pool, selected_pages, destination_page_ids, *, source_page_ids):
+    """Gather each layer/head into disjoint pages of the SAME original GPU pool.
+
+    The CPU ownership lists must describe the frozen selection source and the
+    newly allocated destination. Selected entries must belong to that source;
+    the native TopK plus recent suffix establishes this without a CPU readback.
+    Debug callers should separately validate selection membership/uniqueness.
+    No pages are freed here. Caller retains tensors and waits for completion.
+    """
+    sources, destinations = set(source_page_ids), tuple(destination_page_ids)
+    if any(type(p) is not int or not 0 <= p < pool.shape[1] for p in sources):
+        raise ValueError("Invalid source ownership")
+    if sources.intersection(destinations):
+        raise ValueError("Same-pool gather cannot overwrite any live source page")
+    _pool_copy(pool, pool, destinations, selected_pages)
+
+
+def restore_to_pool(cold_cpu, pool, destination_page_ids):
+    """Scatter mapped pinned CPU slots directly into original GPU pool pages.
+
+    Caller allocates destination pages, keeps cold_cpu alive, and waits for an
+    event before publishing the combined verify page table. No GPU staging.
+    """
+    _pool_copy(cold_cpu, pool, destination_page_ids)

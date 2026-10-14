@@ -75,6 +75,7 @@ def batch_copy_tensor_kernel(
 
 
 class FullCachePtr:
+    APPEND_USES_ALL_KV = False
     # Used for attention metadata
     _MAX_BATCH_SIZE = 4 * 1024
     _MAX_NNZ = 8192 * 4
@@ -297,7 +298,7 @@ class FullCachePtr:
                 kv_data_type=kv_pool._physical_mem_gpu.dtype,
             )
 
-        if cls.__name__ == "PillarCachePtr":
+        if cls.APPEND_USES_ALL_KV:
             # use all-kv-indices, all-kv-len-arr, and all-kv-indptr
             # to index through the page-table
             batch_indices, positions = get_batch_indices_positions(

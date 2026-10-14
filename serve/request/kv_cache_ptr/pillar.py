@@ -16,6 +16,8 @@ from serve.request.request import Request
 
 
 class PillarCachePtr(StreamingCachePtr):
+    # Append uses the physical full/phase page table, separate from draft reads.
+    APPEND_USES_ALL_KV = True
     # these constants are used for jit compile
     MAX_TOTAL_DRAFT_KV_LEN = 128 * 1024
     MAX_TOTAL_VERIFY_KV_LEN = 256 * 1024

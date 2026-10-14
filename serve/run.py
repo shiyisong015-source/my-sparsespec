@@ -35,6 +35,9 @@ def dispatch_str_to_cache_ptr(kv_cache: str):
         return StreamingCachePtr
     elif kv_cache == "pillar":
         return PillarCachePtr
+    elif kv_cache == "compact":
+        from serve.request.kv_cache_ptr.compact import CompactCachePtr
+        return CompactCachePtr
     else:
         raise ValueError(f"Invalid kv_cache: {kv_cache}")
 
@@ -102,7 +105,11 @@ def run_spec_scheduler(
         wandb_logger.init_wandb(config=args)
     logger.info(f"Running SpecScheduler with args: {args}")
 
-    worker = SpecScheduler(kv_pool, model, **args)
+    if args["kv_cache"] == "compact":
+        from serve.scheduler.compact_scheduler import CompactSpecScheduler
+        worker = CompactSpecScheduler(kv_pool, model, **args)
+    else:
+        worker = SpecScheduler(kv_pool, model, **args)
     successful = False
     try:
         ret_reqs = worker.run(reqs)
@@ -174,7 +181,17 @@ def run_inference(
     seed: int = 330,
     packed_gpu_pool_mib: int = None,
     packed_cpu_pool_mib: int = None,
+    compact_pool_pages: int = None,
+    compact_cpu_pages: int = None,
 ):
+    if kv_cache == "compact":
+        if cuda_graph or async_cpu or debug or perf_sim or vanilla_attn or step_log_path is not None:
+            raise ValueError("Native compact requires eager synchronous native attention; step tracing is not supported")
+        if (spec_stride < 1 or not math.isfinite(budget_ratio) or not 0 < budget_ratio <= 1
+                or not spec_stride + 2 <= num_min_budget < 6144):
+            raise ValueError("Native compact requires k>=1, 0<r<=1, k+2<=min_budget<6144")
+        if max_batch_size < 1 or max_batch_size >= FullCachePtr._MAX_BATCH_SIZE or chunk_size < 1:
+            raise ValueError("Invalid native compact batch/chunk capacity")
     if kv_cache == "packed":
         if cuda_graph or async_cpu or debug or step_log_path is not None or enable_torch_profiler:
             raise ValueError("Packed KV currently requires eager synchronous scheduling; "
@@ -208,6 +225,8 @@ def run_inference(
     # Use model_config_name if provided, otherwise use model_name
     config_name = model_name
     model_config = ModelArgs.from_name(config_name)
+    if kv_cache == "compact" and (spec_stride + 1) * model_config.num_qo_heads // model_config.num_kv_heads > 64:
+        raise ValueError("Native score kernel supports GQA*(spec_stride+1)<=64")
     # Auto-resolve clip_length to HF max_position_embeddings if not set
     if clip_length is None:
         if getattr(model_config, "max_position_embeddings", None) is not None:
@@ -288,6 +307,16 @@ def run_inference(
     # assume model weights are evenly sharded
     available_kv_mem = gpu_size_per_rank * tp_ranks - model_size
     num_pages_per_rank = int(available_kv_mem / kv_token_sz / page_size)
+    if compact_pool_pages is not None:
+        if kv_cache != "compact" or type(compact_pool_pages) is not int or compact_pool_pages <= 0:
+            raise ValueError("compact_pool_pages is a positive page budget for kv_cache='compact'")
+        if compact_pool_pages > num_pages_per_rank:
+            raise ValueError("Explicit compact page budget exceeds configured model/KV memory budget")
+        num_pages_per_rank = compact_pool_pages
+    if kv_cache == "compact":
+        compact_cpu_pages = 2 * num_pages_per_rank if compact_cpu_pages is None else compact_cpu_pages
+        if type(compact_cpu_pages) is not int or compact_cpu_pages <= 0:
+            raise ValueError("compact_cpu_pages must be a positive pinned CPU page budget")
     logging.info(
         f"GPU Size: {gpu_size_per_rank / (1024**3):.2f} GB, Model Size: {model_size / (1024**3):.2f} GB, "
         f"Available KV Memory: {available_kv_mem / (1024**3):.2f} GB, "
@@ -325,6 +354,7 @@ def run_inference(
         "acceptance_log_path": acceptance_log_path,
         "step_log_path": step_log_path,
         "seed": seed,
+        "compact_cpu_pages": compact_cpu_pages,
     }
 
     additional_args = {
@@ -361,6 +391,10 @@ def run_inference(
                 )
                 # config is updated according to sharding policy
                 model_config = model.config
+
+            if kv_cache == "compact":
+                import torch.distributed as dist
+                job_args["compact_control_group"] = dist.new_group(backend="gloo") if tp_ranks > 1 else None
 
             # init kv_cache_class
             kv_cache_class = dispatch_str_to_cache_ptr(kv_cache)
@@ -420,6 +454,7 @@ def run_inference(
                     kv_cache_class=kv_cache_class,
                     page_size=page_size,
                     vanilla_backend=vanilla_attn,
+                    allocate_legacy_cpu=kv_cache != "compact",
                 )
 
             with ctx_log(tag="attaching kv_pool", enable_timing=True):
@@ -632,7 +667,7 @@ if __name__ == "__main__":
         choices=["float16", "float32", "bfloat16"],
     )
     argparser.add_argument(
-        "--kv_cache", type=str, default="full", choices=["full", "streaming", "pillar", "packed"]
+        "--kv_cache", type=str, default="full", choices=["full", "streaming", "pillar", "packed", "compact"]
     )
     argparser.add_argument(
         "--admit_policy",
@@ -672,6 +707,10 @@ if __name__ == "__main__":
                            help="GPU KV arena per TP rank, including restore/repack workspaces")
     argparser.add_argument("--packed_cpu_pool_mib", type=int, default=None,
                            help="Pinned CPU KV arena per TP rank")
+    argparser.add_argument("--compact_pool_pages", type=int, default=None,
+                           help="Original GPU KV pool pages including native compact restore/repack peak")
+    argparser.add_argument("--compact_cpu_pages", type=int, default=None,
+                           help="Pinned CPU cold slots per TP rank, including old/new overlap")
     argparser.add_argument("--temperature", type=float, default=0.0)
 
     argparser.add_argument("--perf_sim", action="store_true")
@@ -730,4 +769,6 @@ if __name__ == "__main__":
         enable_torch_profiler=args.enable_torch_profiler,
         packed_gpu_pool_mib=args.packed_gpu_pool_mib,
         packed_cpu_pool_mib=args.packed_cpu_pool_mib,
+        compact_pool_pages=args.compact_pool_pages,
+        compact_cpu_pages=args.compact_cpu_pages,
     )
