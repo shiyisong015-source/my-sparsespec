@@ -33,13 +33,37 @@ def worker(path):
     from serve.request.request import Request
 
     payload = json.loads(path.read_text())
+    scheduler_module = compact
+    scheduler_name = "CompactSpecScheduler"
+    if payload["kwargs"].get("compact_async_transfers", False):
+        if payload["kwargs"].get("async_cpu", False):
+            import serve.scheduler.async_cpu_compact_scheduler as async_cpu_compact
+            scheduler_module = async_cpu_compact
+            scheduler_name = "AsyncCPUCompactSpecScheduler"
+        else:
+            import serve.scheduler.async_compact_scheduler as async_compact
+            scheduler_module = async_compact
+            scheduler_name = "AsyncCompactSpecScheduler"
     rank = int(os.environ["RANK"])
     output = Path(payload["output"])
+    # A queued worker can start after source changes while the controller and
+    # earlier workers still execute their original imported code.
+    source_files = [Path(__file__).resolve(), REPO / "serve/run.py",
+                    REPO / "serve/scheduler/compact_scheduler.py",
+                    REPO / "serve/request/kv_cache_ptr/compact.py",
+                    REPO / "serve/attention/kv_pack.py", REPO / "serve/model/model.py",
+                    REPO / "serve/model/graph_model.py"]
+    if payload["kwargs"].get("compact_async_transfers", False):
+        source_files.append(REPO / "serve/scheduler/async_compact_scheduler.py")
+        if payload["kwargs"].get("async_cpu", False):
+            source_files.append(REPO / "serve/scheduler/async_cpu_compact_scheduler.py")
+    save(output / f"worker-source-sha256.rank{rank}.json", {
+        str(p.relative_to(REPO)): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_files})
     rows, caps = payload["requests"], payload["output_caps"]
     requests = [Request(row["input_ids"], cap) for row, cap in zip(rows, caps, strict=True)]
     audited = list(requests)
 
-    class ObservedScheduler(completion_audit_class(compact.CompactSpecScheduler)):
+    class ObservedScheduler(completion_audit_class(getattr(scheduler_module, scheduler_name))):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.batch_histogram = Counter()
@@ -47,7 +71,9 @@ def worker(path):
             self.observer_start = time.perf_counter()
 
         def prepare_forward_inputs(self):
-            self.batch_histogram[len(self.active_requests)] += 1
+            computing = sum(r.status != Request.ReqExecType.STALL for r in self.active_requests)
+            if computing:
+                self.batch_histogram[computing] += 1
             self.current_phases = dict(Counter(r.status.name for r in self.active_requests))
             return super().prepare_forward_inputs()
 
@@ -68,7 +94,7 @@ def worker(path):
                     print("COMPACT_PROGRESS", json.dumps(progress), flush=True)
             return completed
 
-    compact.CompactSpecScheduler = ObservedScheduler
+    setattr(scheduler_module, scheduler_name, ObservedScheduler)
     kwargs = dict(payload["kwargs"], result_dir=str(output / "engine"),
                   acceptance_log_path=str(output / ("rounds.jsonl" if rank == 0
                                                    else f"rounds.rank{rank}.jsonl")))
@@ -131,7 +157,8 @@ def main():
     source_files = [Path(__file__).resolve(), REPO / "serve/run.py",
                     REPO / "serve/scheduler/compact_scheduler.py",
                     REPO / "serve/request/kv_cache_ptr/compact.py",
-                    REPO / "serve/attention/kv_pack.py", REPO / "serve/model/model.py"]
+                    REPO / "serve/attention/kv_pack.py", REPO / "serve/model/model.py",
+                    REPO / "serve/model/graph_model.py"]
     save(output / "source-sha256.json", {
         str(p.relative_to(REPO)): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_files})
     caps = [32768 - len(row["input_ids"]) for row in rows]

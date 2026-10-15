@@ -106,8 +106,16 @@ def run_spec_scheduler(
     logger.info(f"Running SpecScheduler with args: {args}")
 
     if args["kv_cache"] == "compact":
-        from serve.scheduler.compact_scheduler import CompactSpecScheduler
-        worker = CompactSpecScheduler(kv_pool, model, **args)
+        if args.get("compact_async_transfers"):
+            if args.get("async_cpu"):
+                from serve.scheduler.async_cpu_compact_scheduler import AsyncCPUCompactSpecScheduler
+                worker = AsyncCPUCompactSpecScheduler(kv_pool, model, **args)
+            else:
+                from serve.scheduler.async_compact_scheduler import AsyncCompactSpecScheduler
+                worker = AsyncCompactSpecScheduler(kv_pool, model, **args)
+        else:
+            from serve.scheduler.compact_scheduler import CompactSpecScheduler
+            worker = CompactSpecScheduler(kv_pool, model, **args)
     else:
         worker = SpecScheduler(kv_pool, model, **args)
     successful = False
@@ -117,6 +125,8 @@ def run_spec_scheduler(
     finally:
         worker.close_acceptance_log()
         worker.step_trace.close(successful)
+        if args["kv_cache"] == "compact" and args.get("enable_cuda_graph"):
+            model.release_graphs()
     return ret_reqs
 
 
@@ -183,10 +193,15 @@ def run_inference(
     packed_cpu_pool_mib: int = None,
     compact_pool_pages: int = None,
     compact_cpu_pages: int = None,
+    compact_async_transfers: bool = False,
 ):
+    if compact_async_transfers and kv_cache != "compact":
+        raise ValueError("compact_async_transfers requires kv_cache='compact'")
     if kv_cache == "compact":
-        if cuda_graph or async_cpu or debug or perf_sim or vanilla_attn or step_log_path is not None:
-            raise ValueError("Native compact requires eager synchronous native attention; step tracing is not supported")
+        if debug or perf_sim or vanilla_attn or step_log_path is not None:
+            raise ValueError("Native compact requires native attention; step tracing is not supported")
+        if async_cpu and not compact_async_transfers:
+            raise ValueError("Compact async_cpu requires compact_async_transfers=True")
         if (spec_stride < 1 or not math.isfinite(budget_ratio) or not 0 < budget_ratio <= 1
                 or not spec_stride + 2 <= num_min_budget < 6144):
             raise ValueError("Native compact requires k>=1, 0<r<=1, k+2<=min_budget<6144")
@@ -355,6 +370,7 @@ def run_inference(
         "step_log_path": step_log_path,
         "seed": seed,
         "compact_cpu_pages": compact_cpu_pages,
+        "compact_async_transfers": compact_async_transfers,
     }
 
     additional_args = {
@@ -395,6 +411,8 @@ def run_inference(
             if kv_cache == "compact":
                 import torch.distributed as dist
                 job_args["compact_control_group"] = dist.new_group(backend="gloo") if tp_ranks > 1 else None
+                if async_cpu and tp_ranks > 1:
+                    job_args["compact_rejection_group"] = dist.new_group(backend="nccl")
 
             # init kv_cache_class
             kv_cache_class = dispatch_str_to_cache_ptr(kv_cache)
@@ -711,6 +729,8 @@ if __name__ == "__main__":
                            help="Original GPU KV pool pages including native compact restore/repack peak")
     argparser.add_argument("--compact_cpu_pages", type=int, default=None,
                            help="Pinned CPU cold slots per TP rank, including old/new overlap")
+    argparser.add_argument("--compact_async_transfers", action="store_true",
+                           help="On-demand compact KV transfers on a separate stream; combine with --async_cpu for CPU/GPU pipelining")
     argparser.add_argument("--temperature", type=float, default=0.0)
 
     argparser.add_argument("--perf_sim", action="store_true")
@@ -771,4 +791,5 @@ if __name__ == "__main__":
         packed_cpu_pool_mib=args.packed_cpu_pool_mib,
         compact_pool_pages=args.compact_pool_pages,
         compact_cpu_pages=args.compact_cpu_pages,
+        compact_async_transfers=args.compact_async_transfers,
     )

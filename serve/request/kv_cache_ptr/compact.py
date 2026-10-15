@@ -23,6 +23,9 @@ class PageTransfer:
     ready: object
     cold: object = None
     keepalive: object = None
+    # Already drafted since the last selection; these remain retractable
+    # even when an on-demand offload relocates them into hot destination slots.
+    tail_count: int = 0
 
     def wait(self):
         self.ready.synchronize()
@@ -66,6 +69,7 @@ class CompactCachePtr(PillarCachePtr):
         self.verify_pages = None
         self.verify_epoch = None
         self.needs_pack = False
+        self._resident_selected_at = None
         self._pending = None
         self._closed = False
 
@@ -110,7 +114,8 @@ class CompactCachePtr(PillarCachePtr):
         return num_tokens
 
     def freeze_verify_view(self):
-        if self.phase not in ("full", "verify") or len(self.indices) != self.len_kv_cache:
+        if (self.phase not in ("full", "verify", "resident") or self._pending is not None
+                or len(self.indices) != self.len_kv_cache):
             raise RuntimeError("Verify requires all cold restored before metadata capture")
         self.verify_pages = tuple(self.indices)
         self.verify_epoch = self.epoch
@@ -140,7 +145,42 @@ class CompactCachePtr(PillarCachePtr):
         result = super().get_select_metadata(**config)
         self.recent_count = recent
         self.needs_pack = True
+        self._resident_selected_at = self.len_kv_cache
         return result
+
+    def keep_full_resident(self):
+        """Adopt new sparse indices while retaining all verified GPU pages.
+
+        The selected prefix plus chronological recent/tail still determines
+        draft reads. No KV copy or page release is needed at this boundary.
+        """
+        if (not self.needs_pack or self._pending is not None
+                or len(self.indices) != self.len_kv_cache
+                or self.verify_epoch != self.epoch):
+            raise RuntimeError("Resident adoption requires completed verification/selection")
+        self.phase, self.needs_pack = "resident", False
+        self.hot_pages, self.restored_pages, self.tail_pages = (), (), []
+        self.cold_cpu = None
+        self.verify_pages = self.verify_epoch = None
+
+    def prepare_resident_offload(self):
+        """Freeze a current full view using the last selection and new tail.
+
+        Appending since selection does not change the selected prefix. Force
+        all intervening KV into the chronological hot suffix before packing.
+        """
+        if (self.phase != "resident" or self._pending is not None or self.needs_pack
+                or self._resident_selected_at is None
+                or len(self.indices) != self.len_kv_cache):
+            raise RuntimeError("On-demand offload requires a full resident cache")
+        added = self.len_kv_cache - self._resident_selected_at
+        if added < 0:
+            raise RuntimeError("Resident history was retracted after selection")
+        self.recent_count += added
+        if self.len_selected_indices_gpu + self.recent_count != self.len_loading_indices:
+            raise RuntimeError("Resident sparse view does not cover selected + recent/tail")
+        self.verify_pages, self.verify_epoch = tuple(self.indices), self.epoch
+        self.needs_pack = True
 
     def begin_restore(self):
         if self.phase != "hot" or self._pending is not None or self.needs_pack:
@@ -158,10 +198,14 @@ class CompactCachePtr(PillarCachePtr):
         self._pending = transfer
         return transfer
 
-    def commit_restore(self, transfer):
+    def commit_restore(self, transfer, *, nonblocking=False):
         if transfer is not self._pending:
             raise RuntimeError("Wrong restore transaction")
-        transfer.wait()
+        if nonblocking:
+            if not transfer.ready.query():
+                raise RuntimeError("Cannot commit an unfinished restore")
+        else:
+            transfer.wait()
         selected = len(self.hot_pages) - self.recent_count
         self.restored_pages = transfer.pages
         self.indices = array.array("i", self.hot_pages[:selected] + transfer.pages
@@ -187,7 +231,8 @@ class CompactCachePtr(PillarCachePtr):
             gather_to_pool(physical, plan.hot_pages, pages, source_page_ids=tuple(self.indices))
             pack_selected_kv(physical, plan.cold_pages, cold, plan.cold_count)
             transfer = PageTransfer(pages, torch.cuda.current_stream(physical.device).record_event(),
-                                    cold=cold, keepalive=plan)
+                                    cold=cold, keepalive=plan,
+                                    tail_count=len(self.tail_pages) if self.phase == "resident" else 0)
         except Exception:
             torch.cuda.current_stream(physical.device).synchronize()
             self._release(pages)
@@ -195,15 +240,23 @@ class CompactCachePtr(PillarCachePtr):
         self._pending = transfer
         return transfer
 
-    def commit_pack(self, transfer):
+    def commit_pack(self, transfer, *, nonblocking=False):
         if transfer is not self._pending:
             raise RuntimeError("Wrong pack transaction")
-        transfer.wait()
+        if nonblocking:
+            if not transfer.ready.query():
+                raise RuntimeError("Cannot commit an unfinished pack")
+        else:
+            transfer.wait()
         self._release(tuple(self.indices))
-        self.hot_pages, self.cold_cpu = transfer.pages, transfer.cold
-        self.indices = array.array("i", self.hot_pages)
-        self.restored_pages, self.tail_pages = (), []
-        self.len_loading_indices = len(self.hot_pages)
+        tail_count = transfer.tail_count
+        self.hot_pages = transfer.pages[:-tail_count] if tail_count else transfer.pages
+        self.cold_cpu = transfer.cold
+        self.indices = array.array("i", transfer.pages)
+        self.restored_pages = ()
+        self.tail_pages = list(transfer.pages[-tail_count:]) if tail_count else []
+        self.recent_count -= tail_count
+        self.len_loading_indices = len(transfer.pages)
         count = self.len_selected_indices_gpu
         if count:
             # Future draft reads the destination slots, never the old source IDs.

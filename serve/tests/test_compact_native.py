@@ -11,7 +11,7 @@ import torch
 from serve.attention.kv_pack import gather_to_pool, restore_to_pool
 from serve.attention.kv_partition import partition_pages
 from serve.request.kv_cache_ptr.base import FullCachePtr
-from serve.request.kv_cache_ptr.compact import CompactCachePtr
+from serve.request.kv_cache_ptr.compact import CompactCachePtr, PageTransfer
 from serve.request.kv_cache_ptr.pillar import PillarCachePtr
 from serve.request.request import Request
 
@@ -145,6 +145,116 @@ class CPUOwnership(unittest.TestCase):
                             pool_capacity=pool.capacity, recent_count=2, validate=True)
         ptr.close()
 
+    def test_resident_selection_retains_full_pages_and_offload_includes_new_tail(self):
+        pool, ptr = self.new_ptr()
+        self.select(ptr)
+        original = tuple(ptr.indices)
+        ptr.keep_full_resident()
+        self.assertEqual(ptr.phase, "resident")
+        self.assertEqual(tuple(ptr.indices), original)
+        self.assertEqual(ptr.len_loading_indices, 5)
+        for _ in range(3):
+            ptr.allocate_tokens(1)
+        tail = tuple(ptr.tail_pages)
+        ptr.prepare_resident_offload()
+        self.assertEqual(ptr.recent_count, 5)
+        plan = partition_pages(torch.tensor(ptr.indices, dtype=torch.int32),
+                               ptr.selected_indices_buffer_gpu, ptr.len_selected_indices_gpu,
+                               pool_capacity=pool.capacity, recent_count=ptr.recent_count, validate=True)
+        self.assertEqual((plan.hot_count, plan.cold_count), (8, 7))
+        self.assertEqual(plan.hot_pages[0, 0, -3:].tolist(), list(tail))
+        ptr.close()
+        self.assertEqual(pool.num_free_pages, pool.capacity)
+
+    def test_nonblocking_commit_rejects_unfinished_transfer_without_releasing_sources(self):
+        pool, ptr = self.new_ptr()
+        self.select(ptr)
+        ptr.keep_full_resident()
+        ptr.prepare_resident_offload()
+        original = ptr.owned_pages
+        pages = ptr._allocate(5)
+        transfer = PageTransfer(pages, SimpleNamespace(query=lambda: False, synchronize=lambda: None),
+                                cold=torch.empty(2, 7, 2, 1, 2, 128))
+        ptr._pending = transfer
+        with self.assertRaises(RuntimeError):
+            ptr.commit_pack(transfer, nonblocking=True)
+        self.assertTrue(original <= ptr.owned_pages)
+        self.assertIs(ptr._pending, transfer)
+        with self.assertRaises(RuntimeError):
+            ptr.allocate_tokens(1)
+        ptr.abort_transfer(transfer)
+        ptr.close()
+        self.assertEqual(pool.num_free_pages, pool.capacity)
+
+
+class CPUGraphCapture(unittest.TestCase):
+    def check_capture(self, cache_class, sparse):
+        from serve.model.graph_model import CUDAGraphModelWrapper
+
+        inputs = []
+        pool = SimpleNamespace(page_size=1, capacity=4096,
+                               kv_cache_class=cache_class, phase=0,
+                               pre_attn_fwd=lambda **kwargs: inputs.append(kwargs))
+
+        def step():
+            pool.phase ^= 1
+
+        pool.step = step
+
+        class Model:
+            kv_cache = pool
+            device = "cpu"
+            config = SimpleNamespace(vocab_size=32)
+
+            def __call__(self, ids):
+                return torch.zeros(ids.shape[0], 32)
+
+        sentinel = torch.tensor([71], dtype=torch.int32)
+        module = "serve.model.graph_model"
+        with patch.object(cache_class, "draft_kv_indices_tensor_buf", sentinel, create=True), \
+             patch(f"{module}.torch.cuda.empty_cache"), \
+             patch(f"{module}.torch.cuda.memory_reserved", return_value=0), \
+             patch(f"{module}._CUDAGraphModelRunner") as runner:
+            wrapper = CUDAGraphModelWrapper(Model())
+            wrapper.capture([1])
+        self.assertEqual(runner.return_value.capture.call_count, 2)
+        self.assertEqual(len(wrapper.graph_runners[1]), 2)
+        self.assertEqual(pool.phase, 0)
+        self.assertEqual(len(inputs), 2)
+        for metadata in inputs:
+            self.assertEqual("request_type" in metadata, sparse)
+            if sparse:
+                self.assertIs(metadata["flatten_indices"], sentinel)
+                torch.testing.assert_close(metadata["all_kv_len_arr"], metadata["kv_len_arr"])
+                torch.testing.assert_close(metadata["all_kv_indptr"], metadata["kv_indptr"])
+
+    def test_compact_subclass_capture_uses_its_own_sparse_metadata(self):
+        self.check_capture(LocalPtr, sparse=True)
+
+    def test_full_cache_capture_does_not_require_sparse_metadata(self):
+        self.check_capture(FullCachePtr, sparse=False)
+
+    def test_release_waits_then_resets_both_phases_and_preserves_statistics(self):
+        from serve.model.graph_model import CUDAGraphModelWrapper
+
+        events = []
+        model = SimpleNamespace(kv_cache=object(), device="cpu")
+        wrapper = CUDAGraphModelWrapper(model)
+        wrapper.graph_runners[8] = [
+            SimpleNamespace(cuda_graph=SimpleNamespace(reset=lambda: events.append("phase0"))),
+            SimpleNamespace(cuda_graph=SimpleNamespace(reset=lambda: events.append("phase1"))),
+        ]
+        wrapper.captured_bsz = [8]
+        wrapper.num_total_tokens, wrapper.num_captured_tokens, wrapper.num_padded_tokens = 7, 7, 1
+        with patch("torch.cuda.synchronize", side_effect=lambda device: events.append("wait")):
+            wrapper.release_graphs()
+            wrapper.release_graphs()
+        self.assertEqual(events, ["wait", "phase0", "phase1"])
+        self.assertFalse(wrapper.graph_runners)
+        self.assertIsNone(wrapper.captured_bsz)
+        self.assertEqual((wrapper.num_total_tokens, wrapper.num_captured_tokens,
+                          wrapper.num_padded_tokens), (7, 7, 1))
+
 
 class CPUCapacity(unittest.TestCase):
     @staticmethod
@@ -165,6 +275,60 @@ class CPUCapacity(unittest.TestCase):
         scheduler.metrics = dict(admission_waits=0, capacity_waits=0, max_live_requests=0)
         scheduler.active_requests, scheduler.offload_requests = [], []
         return scheduler
+
+    def test_transfer_timing_separates_event_wait_tp_exchange_and_commit(self):
+        scheduler = self.scheduler()
+        scheduler.group, scheduler.step_id = object(), 7
+        clock = [0.]
+        calls = []
+
+        def wait():
+            calls.append("wait")
+            if len(calls) == 1:
+                clock[0] += 3.  # Only the first event wait blocks on GPU work.
+
+        transfer = SimpleNamespace(wait=wait)
+
+        def begin():
+            clock[0] += 2.
+            return transfer
+
+        def commit(result):
+            self.assertIs(result, transfer)
+            result.wait()  # Existing commit calls wait again on the same event.
+            clock[0] += 1.
+
+        def exchange(errors, error, group):
+            clock[0] += 5.
+            errors[:] = [None, None]
+
+        module = "serve.scheduler.compact_scheduler"
+        with patch(f"{module}.time.perf_counter", side_effect=lambda: clock[0]), \
+             patch(f"{module}.dist.get_world_size", return_value=2), \
+             patch(f"{module}.dist.all_gather_object", side_effect=exchange):
+            self.assertIs(scheduler._timed_transfer("restore", begin, commit, None), transfer)
+        report = scheduler.transfer_timing_snapshot(elapsed_seconds=20.)
+        self.assertEqual(report["directions"]["restore"], dict(
+            submit_wall_seconds=2., event_wait_wall_seconds=3.,
+            tp_coordination_wall_seconds=5., commit_wall_seconds=1.))
+        self.assertEqual(report["transfer_event_wait_fraction"], .15)
+        self.assertEqual(report["transfer_section_wall_fraction"], .55)
+        self.assertEqual(calls, ["wait", "wait"])
+        self.assertEqual(report["directions"]["repack"]["event_wait_wall_seconds"], 0.)
+
+    def test_transfer_timing_zero_interval_and_no_tp_exchange(self):
+        scheduler = self.scheduler()
+        scheduler.step_id, scheduler._run_start_perf_counter = 0, None
+        transfer = SimpleNamespace(wait=lambda: None)
+        module = "serve.scheduler.compact_scheduler"
+        with patch(f"{module}.time.perf_counter", return_value=10.), \
+             patch(f"{module}.dist.all_gather_object") as exchange:
+            scheduler._timed_transfer("repack", lambda: transfer, lambda result: None, None)
+        exchange.assert_not_called()
+        report = scheduler.transfer_timing_snapshot()
+        self.assertEqual(report["elapsed_seconds"], 0.)
+        self.assertEqual(report["transfer_event_wait_fraction"], 0.)
+        self.assertEqual(report["directions"]["repack"]["tp_coordination_wall_seconds"], 0.)
 
     def test_long_request_peak_and_all_full_to_hot_transitions(self):
         scheduler = self.scheduler()
@@ -264,8 +428,315 @@ class CPUCapacity(unittest.TestCase):
             self.assertEqual(original.call_count, 2)
 
 
+class CPUAsyncTransfers(unittest.TestCase):
+    @staticmethod
+    def scheduler():
+        base = CPUCapacity.scheduler()
+        from serve.scheduler.async_compact_scheduler import AsyncCompactSpecScheduler
+        scheduler = AsyncCompactSpecScheduler.__new__(AsyncCompactSpecScheduler)
+        scheduler.__dict__.update(base.__dict__)
+        scheduler.spec_stride, scheduler.step_id, scheduler.page_bytes = 3, 0, 1
+        scheduler.spec_cache_args = dict(budget_ratio=.1, num_min_budget=5)
+        scheduler._requests, scheduler._transfers = {}, {}
+        scheduler.metrics.update(restores=0, migrations=0, h2d_bytes=0, d2h_bytes=0,
+                                 freed_source_pages=0, transfer_poll_tp_wall_seconds=0.,
+                                 max_live_requests=0, transfer_idle_waits=0)
+        return scheduler
+
+    @staticmethod
+    def request(pool, identity, length=12):
+        pages = [pool.alloc_page() for _ in range(length)]
+        full = FullCachePtr(pool, array.array("i", pages), length)
+        ptr, _ = LocalPtr.from_kv_cache(full)
+        CPUOwnership().select(ptr)
+        ptr.keep_full_resident()
+        request = Request(list(range(length + 1)), 8)
+        request.request_id, request.status = identity, Request.ReqExecType.DRAFT
+        request.initial_idx, request.cur_spec_idx = 0, 1
+        request.kv_cache_ptr = ptr
+        return request
+
+    def test_low_pressure_draft_keeps_full_resident_without_any_transfer(self):
+        scheduler = self.scheduler()
+        pool = Pool(capacity=64)
+        request = self.request(pool, 0)
+        scheduler.kv_pool, scheduler._requests = pool, {0: request}
+        pages = request.kv_cache_ptr.owned_pages
+        with patch.object(scheduler, "_submit_transfer") as submit:
+            scheduler.admit_requests([])
+        submit.assert_not_called()
+        self.assertEqual(scheduler.active_requests, [request])
+        self.assertEqual(request.kv_cache_ptr.owned_pages, pages)
+        request.retire()
+
+    def test_unfinished_restore_waits_while_other_request_is_ready(self):
+        from serve.scheduler.async_compact_scheduler import TransferJob
+        scheduler = self.scheduler()
+        pool = Pool(capacity=64)
+        restoring, ready = [self.request(pool, identity) for identity in (0, 1)]
+        restoring.status = Request.ReqExecType.VERIFY
+        restoring.kv_cache_ptr.phase = "hot"
+        transfer = SimpleNamespace(ready=SimpleNamespace(query=lambda: False),
+                                   wait=lambda: self.fail("Scheduling blocked on a pending event"))
+        scheduler.kv_pool = pool
+        scheduler._requests = {r.request_id: r for r in (restoring, ready)}
+        scheduler._transfers = {0: TransferJob(restoring, "restore", transfer, 5, 7)}
+        scheduler.admit_requests([])
+        self.assertEqual(scheduler.active_requests, [ready])
+        self.assertEqual(scheduler.offload_requests, [restoring])
+        self.assertIn(0, scheduler._transfers)
+        restoring.retire()
+        ready.retire()
+
+    def test_tp_local_completion_does_not_commit_until_every_rank_is_ready(self):
+        from serve.scheduler.async_compact_scheduler import TransferJob
+        scheduler = self.scheduler()
+        scheduler.group = object()
+        commits = []
+        ptr = SimpleNamespace(commit_restore=lambda *args, **kwargs: commits.append(kwargs))
+        request = SimpleNamespace(kv_cache_ptr=ptr)
+        transfer = SimpleNamespace(ready=SimpleNamespace(query=lambda: True))
+        scheduler._transfers = {0: TransferJob(request, "restore", transfer, 5, 7)}
+        remote_ready = [False]
+
+        def exchange(observations, local, group):
+            observations[:] = [local, [(0, "restore", remote_ready[0])]]
+
+        module = "serve.scheduler.async_compact_scheduler"
+        with patch(f"{module}.dist.get_world_size", return_value=2), \
+             patch(f"{module}.dist.all_gather_object", side_effect=exchange):
+            scheduler._poll_transfers()
+            self.assertEqual(commits, [])
+            self.assertIn(0, scheduler._transfers)
+            remote_ready[0] = True
+            scheduler._poll_transfers()
+        self.assertEqual(commits, [dict(nonblocking=True)])
+        self.assertEqual(scheduler._transfers, {})
+        self.assertEqual(scheduler.metrics["h2d_bytes"], 7)
+
+    def test_empty_ready_batch_waits_and_commits_without_forward(self):
+        from serve.scheduler.async_compact_scheduler import TransferJob
+        scheduler = self.scheduler()
+        ready, commits, waits = [False], [], []
+
+        def wait():
+            waits.append(True)
+            ready[0] = True
+
+        ptr = SimpleNamespace(commit_restore=lambda *args, **kwargs: commits.append(kwargs))
+        request = SimpleNamespace(kv_cache_ptr=ptr)
+        transfer = SimpleNamespace(wait=wait, ready=SimpleNamespace(query=lambda: ready[0]))
+        scheduler._transfers = {0: TransferJob(request, "restore", transfer, 5, 7)}
+        scheduler.wait_for_ready_requests()
+        self.assertEqual(waits, [True])
+        self.assertEqual(commits, [dict(nonblocking=True)])
+        self.assertEqual(scheduler._transfers, {})
+        self.assertEqual(scheduler.metrics["transfer_idle_waits"], 1)
+        self.assertGreaterEqual(scheduler.metrics["restore_event_wait_wall_seconds"], 0.)
+
+    def test_offload_locks_source_pages_and_other_drafts_can_use_future_reserve(self):
+        from serve.scheduler.async_compact_scheduler import TransferJob
+        scheduler = self.scheduler()
+        pool = Pool(capacity=48)
+        requests = [self.request(pool, identity) for identity in range(3)]
+        for request in requests:
+            request.kv_cache_ptr.allocate_tokens(1)
+        scheduler.kv_pool = pool
+        scheduler._requests = {r.request_id: r for r in requests}
+        original = requests[0].kv_cache_ptr.owned_pages
+
+        def submit(request, direction):
+            self.assertEqual(direction, "repack")
+            ptr = request.kv_cache_ptr
+            ptr.prepare_resident_offload()
+            destinations = ptr._allocate(ptr.len_loading_indices)
+            transfer = SimpleNamespace(pages=destinations, ready=SimpleNamespace(query=lambda: False))
+            scheduler._transfers[request.request_id] = TransferJob(
+                request, direction, transfer, len(ptr.indices), len(ptr.indices)-len(destinations))
+
+        with patch.object(scheduler, "_submit_transfer", side_effect=submit):
+            scheduler.admit_requests([])
+        self.assertEqual([r.request_id for r in scheduler.active_requests], [1, 2])
+        self.assertTrue(original <= requests[0].kv_cache_ptr.owned_pages)
+        self.assertEqual(pool.num_free_pages, 3)
+        for request in requests:
+            request.retire()
+        self.assertEqual(pool.num_free_pages, pool.capacity)
+
+
+class CPUAsyncPipeline(unittest.TestCase):
+    @staticmethod
+    def scheduler():
+        base = CPUAsyncTransfers.scheduler()
+        from serve.scheduler.async_cpu_compact_scheduler import AsyncCPUCompactSpecScheduler
+        scheduler = AsyncCPUCompactSpecScheduler.__new__(AsyncCPUCompactSpecScheduler)
+        scheduler.__dict__.update(base.__dict__)
+        scheduler.async_on = True
+        scheduler.kv_pool.device = "cpu"
+        scheduler._retired, scheduler._output_keepalive = [], []
+        scheduler._compute_fences, scheduler._patched_requests = {}, []
+        scheduler.metrics.update(deferred_retirements=0, max_deferred_retirements=0,
+                                 cpu_result_readback_wall_seconds=0.,
+                                 cpu_result_update_wall_seconds=0., cpu_updates_with_forward_inflight=0,
+                                 retirement_idle_wait_seconds=0.)
+        return scheduler
+
+    def test_invalid_later_request_leaves_all_original_retirement_methods_intact(self):
+        scheduler = self.scheduler()
+        requests = [Request([1], 8), Request([1], 0)]
+        with self.assertRaises(ValueError):
+            scheduler.run(requests)
+        self.assertTrue(all("retire" not in r.__dict__ for r in requests))
+        self.assertEqual(scheduler._patched_requests, [])
+
+    def test_retirement_keeps_pages_and_probs_until_compute_and_control_complete(self):
+        scheduler = self.scheduler()
+        pool = Pool(capacity=64)
+        request = CPUAsyncTransfers.request(pool, 0)
+        request.draft_probs = torch.ones(2, 3)
+        compute, control = [False], [False]
+        scheduler._compute_fences[0] = SimpleNamespace(query=lambda: compute[0])
+        ptr, probs = request.kv_cache_ptr, request.draft_probs
+        scheduler._defer_retire(request)
+        scheduler._retired[0].control_done = SimpleNamespace(query=lambda: control[0])
+        self.assertIsNone(request.kv_cache_ptr)
+        self.assertIs(scheduler._retired[0].probs, probs)
+        scheduler._poll_retired()
+        self.assertEqual(pool.num_free_pages, 52)
+        compute[0] = True
+        scheduler._poll_retired()
+        self.assertEqual(pool.num_free_pages, 52)
+        control[0] = True
+        scheduler._poll_retired()
+        self.assertEqual(pool.num_free_pages, pool.capacity)
+        self.assertEqual(scheduler._retired, [])
+        self.assertTrue(ptr._closed)
+
+    def test_tp_retirement_waits_for_remote_rank(self):
+        scheduler = self.scheduler()
+        pool = Pool(capacity=64)
+        request = CPUAsyncTransfers.request(pool, 0)
+        scheduler._defer_retire(request)
+        scheduler._retired[0].control_done = SimpleNamespace(query=lambda: True)
+        scheduler.group = object()
+        remote = [False]
+
+        def exchange(outputs, local, group):
+            outputs[:] = [local, remote[:]]
+
+        with patch("serve.scheduler.async_cpu_compact_scheduler.dist.get_world_size", return_value=2), \
+             patch("serve.scheduler.async_cpu_compact_scheduler.dist.all_gather_object", side_effect=exchange):
+            scheduler._poll_retired()
+            self.assertEqual(pool.num_free_pages, 52)
+            remote[0] = True
+            scheduler._poll_retired()
+        self.assertEqual(pool.num_free_pages, pool.capacity)
+
+    def test_page_pressure_waits_for_retirement_instead_of_reporting_oom(self):
+        scheduler = self.scheduler()
+        pool = Pool(capacity=24)
+        retired, live = [CPUAsyncTransfers.request(pool, identity) for identity in range(2)]
+        compute, control = [False], [False]
+        scheduler._compute_fences[0] = SimpleNamespace(
+            query=lambda: compute[0], synchronize=lambda: compute.__setitem__(0, True))
+        scheduler._defer_retire(retired)
+        scheduler._retired[0].control_done = SimpleNamespace(
+            query=lambda: control[0], synchronize=lambda: control.__setitem__(0, True))
+        scheduler.kv_pool, scheduler._requests = pool, {1: live}
+        scheduler.admit_requests([])
+        self.assertEqual(scheduler.active_requests, [])
+        self.assertEqual(pool.num_free_pages, 0)
+        scheduler.wait_for_ready_requests()
+        self.assertEqual(pool.num_free_pages, 12)
+        scheduler.admit_requests([])
+        self.assertEqual(scheduler.active_requests, [live])
+        live.retire()
+        self.assertEqual(pool.num_free_pages, pool.capacity)
+
+    def test_all_stall_batch_has_zero_queries_but_current_selection_page_table(self):
+        scheduler = self.scheduler()
+        pool = Pool(capacity=64)
+        requests = [CPUAsyncTransfers.request(pool, identity) for identity in range(2)]
+        for index, request in enumerate(requests):
+            request.status = Request.ReqExecType.STALL
+            request.prev_idx = 1 - index
+        scheduler.kv_pool = pool
+        scheduler._requests = {r.request_id: r for r in requests}
+        scheduler.admit_requests([])
+        self.assertEqual([r.request_id for r in scheduler.active_requests], [1, 0])
+        host, tensors = scheduler.prepare_forward_inputs()
+        self.assertIsNone(host)
+        self.assertIsNone(tensors)
+        self.assertEqual(list(scheduler.spec_cache_args["all_kv_indptr_cpu"]), [0, 12, 24])
+        expected = list(requests[1].kv_cache_ptr.indices) + list(requests[0].kv_cache_ptr.indices)
+        self.assertEqual(scheduler.spec_cache_args["all_kv_indices_gpu"].tolist(), expected)
+        for request in requests:
+            request.retire()
+
+    def test_result_consumption_waits_previous_event_without_waiting_current_forward(self):
+        from serve.scheduler.async_cpu_compact_scheduler import ForwardOutput
+        scheduler = self.scheduler()
+        calls = []
+        consumed = SimpleNamespace(query=lambda: True)
+        control = SimpleNamespace(wait_event=lambda event: calls.append("previous dependency"),
+                                  record_event=lambda: consumed)
+        tensor = SimpleNamespace(record_stream=lambda stream: calls.append("retain on control"))
+        previous = ForwardOutput({}, {}, tensor, tensor, object())
+        scheduler.update_metadata_host = lambda *args: calls.append("previous readback")
+        scheduler.update_requests = lambda *args: calls.append("previous result") or []
+        with patch("torch.cuda.current_stream", return_value=control):
+            completed, event = scheduler._consume_previous(
+                previous, dict(token_indptr=[0, 1]), {}, SimpleNamespace(query=lambda: False))
+        self.assertEqual(calls, ["previous dependency", "retain on control", "retain on control",
+                                 "previous readback", "previous result"])
+        self.assertEqual(completed, [])
+        self.assertIs(event, consumed)
+        self.assertEqual(scheduler.metrics["cpu_updates_with_forward_inflight"], 1)
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA device required")
 class GPUContent(CPUOwnership):
+    def test_resident_to_offloaded_to_restored_preserves_selected_content(self):
+        pool, ptr = self.new_ptr("cuda:0")
+        self.select(ptr)
+        ptr.keep_full_resident()
+        for _ in range(3):
+            ptr.allocate_tokens(1)
+        ptr.prepare_resident_offload()
+        plan = partition_pages(torch.tensor(ptr.indices, device=pool.device, dtype=torch.int32),
+                               ptr.selected_indices_buffer_gpu, ptr.len_selected_indices_gpu,
+                               pool_capacity=pool.capacity, recent_count=ptr.recent_count, validate=True)
+        hot = selected_copy(pool._physical_mem_gpu, plan.hot_pages).clone()
+        cold = selected_copy(pool._physical_mem_gpu, plan.cold_pages).clone()
+        transfer = ptr.begin_pack(validate=True)
+        transfer.wait()
+        ptr.commit_pack(transfer, nonblocking=True)
+        self.assertEqual(len(ptr.tail_pages), 3)
+        self.assertEqual(ptr.recent_count, 2)
+        torch.testing.assert_close(pool._physical_mem_gpu[:, list(ptr.indices)], hot, rtol=0, atol=0)
+        torch.testing.assert_close(ptr.cold_cpu, cold.cpu(), rtol=0, atol=0)
+        transfer = ptr.begin_restore()
+        transfer.wait()
+        ptr.commit_restore(transfer, nonblocking=True)
+        selected = ptr.len_selected_indices_gpu
+        expected = torch.cat([hot[:, :selected], cold, hot[:, selected:]], dim=1)
+        torch.testing.assert_close(pool._physical_mem_gpu[:, list(ptr.indices)], expected, rtol=0, atol=0)
+        # A rejection can cross the migration boundary: three tail slots were
+        # moved before offload, then two more were appended after restoration.
+        for _ in range(2):
+            ptr.allocate_tokens(1)
+        rejected = set(ptr.tail_pages[-4:])
+        ptr.freeze_verify_view()
+        ptr.retract_tokens(4)
+        self.assertEqual(len(ptr.tail_pages), 1)
+        self.assertTrue(rejected.isdisjoint(ptr.owned_pages))
+        self.select(ptr)
+        ptr.keep_full_resident()
+        self.assertIsNone(ptr.cold_cpu)
+        self.assertEqual(len(ptr.indices), ptr.len_kv_cache)
+        ptr.close()
+        self.assertEqual(pool.num_free_pages, pool.capacity)
+
     def test_zero_cold_boundary_restore_and_close(self):
         pool, ptr = self.new_ptr("cuda:0")
         ptr.freeze_verify_view()

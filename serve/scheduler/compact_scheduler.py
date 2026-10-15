@@ -18,7 +18,7 @@ from serve.request.request import Request
 from serve.scheduler.spec_scheduler import SpecScheduler
 
 
-def coordinated(group, label, operation, rollback=None):
+def coordinated(group, label, operation, rollback=None, *, timing=None):
     """Coordinate setup/allocation errors before the next model collective.
 
     CUDA faults during a model collective are fatal; this is not recovery.
@@ -29,9 +29,13 @@ def coordinated(group, label, operation, rollback=None):
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     errors = [error]
+    exchange_started = time.perf_counter() if timing is not None and group is not None else None
     if group is not None:
         errors = [None] * dist.get_world_size(group)
         dist.all_gather_object(errors, error, group=group)
+    if timing is not None:
+        timing["tp_coordination_wall_seconds"] = (
+            time.perf_counter() - exchange_started if exchange_started is not None else 0.)
     if any(errors):
         if result is not None and rollback is not None:
             rollback(result)
@@ -50,14 +54,18 @@ class _RankZeroRejection:
                              torch.empty((len(kwargs["num_draft_tokens"]), kwargs["max_spec_len"] + 1),
                                          dtype=torch.int32, device=scheduler.kv_pool.device))
         if scheduler.group is not None:
-            dist.broadcast(result, src=0)
+            rejection_group = getattr(scheduler, "rejection_group", None)
+            if rejection_group is None:
+                dist.broadcast(result, src=0)
+            else:
+                dist.broadcast(result, src=0, group=rejection_group)
         return result
 
 
 class CompactSpecScheduler(SpecScheduler):
     def __init__(self, kv_pool, model, **kwargs):
-        if kwargs.get("async_cpu") or kwargs.get("enable_cuda_graph"):
-            raise ValueError("Native compact currently uses synchronous eager execution")
+        if kwargs.get("async_cpu"):
+            raise ValueError("Use the compact CPU pipeline scheduler for async_cpu")
         k, ratio, minimum = kwargs["spec_stride"], kwargs["budget_ratio"], kwargs["num_min_budget"]
         if (k < 1 or not math.isfinite(ratio) or not 0 < ratio <= 1
                 or not k + 2 <= minimum < CompactCachePtr.MAX_LEN_SELECTED_KV_CACHE):
@@ -82,9 +90,69 @@ class CompactSpecScheduler(SpecScheduler):
         self.page_bytes = (kv_pool.num_layers * 2 * kv_pool.num_kv_heads * kv_pool.head_dim
                            * kv_pool._physical_mem_gpu.element_size())
         self._last_served = {}
+        self._run_start_perf_counter = None
         self._result_dir = kwargs.get("profiler_result_dir")
         if self._result_dir:
             os.makedirs(self._result_dir, exist_ok=True)
+
+    def _timed_transfer(self, direction, begin, commit, rollback):
+        """Measure existing host waits, with no additional CUDA synchronization.
+
+        Repack's event covers partition, hot gather and cold offload together.
+        Submission wall time may itself include implicit allocation/setup waits.
+        The commit waits on the same completed event; account it separately.
+        """
+        timing = {}
+
+        def operation():
+            started = time.perf_counter()
+            transfer = begin()
+            timing["submit_wall_seconds"] = time.perf_counter() - started
+            started = time.perf_counter()
+            transfer.wait()
+            timing["event_wait_wall_seconds"] = time.perf_counter() - started
+            return transfer
+
+        transfer = coordinated(self.group, direction, operation, rollback, timing=timing)
+        started = time.perf_counter()
+        commit(transfer)
+        timing["commit_wall_seconds"] = time.perf_counter() - started
+        for name, seconds in timing.items():
+            key = f"{direction}_{name}"
+            self.metrics[key] = self.metrics.get(key, 0.) + seconds
+        return transfer
+
+    def transfer_timing_snapshot(self, elapsed_seconds=None):
+        """Rank-local CPU blocking fractions, never summed across TP ranks."""
+        if elapsed_seconds is None:
+            elapsed_seconds = (time.perf_counter() - self._run_start_perf_counter
+                               if self._run_start_perf_counter is not None else 0.)
+        stages = ("submit_wall_seconds", "event_wait_wall_seconds",
+                  "tp_coordination_wall_seconds", "commit_wall_seconds")
+        totals = {direction: {stage: self.metrics.get(f"{direction}_{stage}", 0.)
+                             for stage in stages} for direction in ("restore", "repack")}
+        wait = sum(values["event_wait_wall_seconds"] for values in totals.values())
+        section = sum(sum(values.values()) for values in totals.values())
+        return dict(rank=self.rank, step=self.step_id, wall_time=time.time(),
+                    elapsed_seconds=elapsed_seconds, directions=totals,
+                    transfer_event_wait_seconds=wait,
+                    transfer_event_wait_fraction=wait / elapsed_seconds if elapsed_seconds > 0 else 0.,
+                    transfer_section_wall_seconds=section,
+                    transfer_section_wall_fraction=section / elapsed_seconds if elapsed_seconds > 0 else 0.,
+                    scope="existing rank-local CPU event waits; no extra CUDA synchronization",
+                    repack_wait_scope="partition + hot gather + cold D2H, not pure D2H",
+                    submission_scope="allocation/setup/submission wall time, including implicit waits",
+                    commit_scope="page-table update/release and repeated wait on an already completed event")
+
+    def _write_transfer_timing(self, elapsed_seconds=None, complete=False):
+        if self._result_dir is None:
+            return
+        report = self.transfer_timing_snapshot(elapsed_seconds)
+        report["complete"] = complete
+        path = os.path.join(self._result_dir, f"transfer-timing.rank{self.rank}.json")
+        with open(path + ".tmp", "w") as out:
+            json.dump(report, out, indent=2)
+        os.replace(path + ".tmp", path)
 
     def _estimate(self, request):
         # The original scheduler checks limits after verify and can overshoot
@@ -194,12 +262,8 @@ class CompactSpecScheduler(SpecScheduler):
         for request in self.active_requests:
             ptr = request.kv_cache_ptr
             if request.status == Request.ReqExecType.VERIFY and ptr.phase == "hot":
-                def restore():
-                    transfer = ptr.begin_restore()
-                    transfer.wait()
-                    return transfer
-                transfer = coordinated(self.group, "restore", restore, ptr.abort_transfer)
-                ptr.commit_restore(transfer)
+                self._timed_transfer("restore", ptr.begin_restore, ptr.commit_restore,
+                                     ptr.abort_transfer)
                 self.metrics["restores"] += 1
                 self.metrics["h2d_bytes"] += ptr.cold_count * self.page_bytes
                 self._record_peak()
@@ -233,10 +297,8 @@ class CompactSpecScheduler(SpecScheduler):
                 def pack():
                     transfer = ptr.begin_pack(validate=self.validate_moves)
                     self._record_peak(extra_cpu=transfer.cold.shape[1])
-                    transfer.wait()
                     return transfer
-                transfer = coordinated(self.group, "repack", pack, ptr.abort_transfer)
-                ptr.commit_pack(transfer)
+                self._timed_transfer("repack", pack, ptr.commit_pack, ptr.abort_transfer)
                 self.metrics["migrations"] += 1
                 self.metrics["d2h_bytes"] += ptr.cold_count * self.page_bytes
                 self.metrics["freed_source_pages"] += old_count
@@ -254,10 +316,14 @@ class CompactSpecScheduler(SpecScheduler):
                 raise ValueError("Request's maximum hot budget must be strictly below 6144")
         completed = []
         start = time.perf_counter()
+        self._run_start_perf_counter = start
         try:
             while pending_requests or self.active_requests or self.offload_requests:
                 self.step_id += 1
                 coordinated(self.group, "admission", lambda: self.admit_requests(pending_requests))
+                if not self.active_requests:
+                    self.wait_for_ready_requests()
+                    continue
                 phases = [request.status for request in self.active_requests]
                 def setup():
                     host, tensors = self.prepare_forward_inputs()
@@ -283,8 +349,11 @@ class CompactSpecScheduler(SpecScheduler):
                 self.metrics["max_actual_batch"] = max(self.metrics["max_actual_batch"], len(phases))
                 self.metrics["mixed_forwards"] += int(len(set(phases)) > 1)
                 self.prof.step()
+                if self.step_id % 100 == 0:
+                    self._write_transfer_timing()
             torch.cuda.current_stream(self.kv_pool.device).synchronize()
             self.metrics["elapsed_seconds"] = time.perf_counter() - start
+            self._write_transfer_timing(self.metrics["elapsed_seconds"], complete=True)
             self.metrics["gpu_final_free_pages"] = self.kv_pool.num_free_pages
             self.metrics["gpu_capacity_pages"] = self.kv_pool.capacity
             if self.kv_pool.num_free_pages != self.kv_pool.capacity:

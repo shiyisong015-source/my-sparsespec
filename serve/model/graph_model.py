@@ -182,7 +182,8 @@ class CUDAGraphModelWrapper:
 
                 # Add more metadata if pillar
                 # [request_type, verify_kv_indptr, flatten_indices] + [flatten_indices_len]
-                if self.kv_cache.kv_cache_class == PillarCachePtr:
+                cache_class = self.kv_cache.kv_cache_class
+                if issubclass(cache_class, PillarCachePtr):
                     # just assume all requests are normal decode requests
                     request_type = torch.full(
                         (batch_size,),
@@ -195,7 +196,7 @@ class CUDAGraphModelWrapper:
                         device=self.model.device,
                         dtype=torch.int32,
                     )
-                    flatten_indices = PillarCachePtr.draft_kv_indices_tensor_buf
+                    flatten_indices = cache_class.draft_kv_indices_tensor_buf
                     flatten_indices_len = 0  # no draft requests
 
                     kwargs.update(
@@ -275,6 +276,22 @@ class CUDAGraphModelWrapper:
 
     def __call__(self, **kwargs):
         return self.forward(**kwargs)
+
+    def release_graphs(self):
+        """Release captured NCCL references before process-group teardown.
+
+        Compact schedulers can remain alive through Python reference cycles.
+        Do not rely on their model graphs being garbage-collected at return.
+        Counters survive release for the final inference summary.
+        """
+        if not self.graph_runners:
+            return
+        torch.cuda.synchronize(self.device)
+        for runners in self.graph_runners.values():
+            for runner in runners:
+                runner.cuda_graph.reset()
+        self.graph_runners.clear()
+        self.captured_bsz = None
 
     @property
     def device(self):
