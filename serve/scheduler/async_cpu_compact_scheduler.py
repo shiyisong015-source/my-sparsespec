@@ -46,9 +46,6 @@ class AsyncCPUCompactSpecScheduler(AsyncCompactSpecScheduler):
         self.async_on = True
         self._args["async_cpu"] = self.spec_cache_args["async_cpu"] = True
         self.compute_stream = torch.cuda.Stream(device=kv_pool.device)
-        self.rejection_group = kwargs.get("compact_rejection_group")
-        if kwargs["tp_ranks"] > 1 and self.rejection_group is None:
-            raise ValueError("TP CPU pipeline requires an independent NCCL rejection group")
         self._compute_fences = {}
         self._retired = []
         self._output_keepalive = []
@@ -199,7 +196,7 @@ class AsyncCPUCompactSpecScheduler(AsyncCompactSpecScheduler):
                 self._patched_requests.append(request)
             while pending_requests or self._requests or self._transfers:
                 self.step_id += 1
-                coordinated(self.group, "CPU pipeline admission", lambda: self.admit_requests(pending_requests))
+                self._run_stage("CPU pipeline admission", lambda: self.admit_requests(pending_requests))
                 if not self.active_requests:
                     self.wait_for_ready_requests()
                     continue
@@ -212,7 +209,7 @@ class AsyncCPUCompactSpecScheduler(AsyncCompactSpecScheduler):
                         self.model.register_input(**tensors)
                     return host, tensors
 
-                host, tensors = coordinated(self.group, "CPU pipeline metadata", setup)
+                host, tensors = self._run_stage("CPU pipeline metadata", setup)
                 model_done, tokens, probs = None, None, None
                 if host is not None:
                     if previous is not None:
@@ -231,8 +228,8 @@ class AsyncCPUCompactSpecScheduler(AsyncCompactSpecScheduler):
                     self._record_peak()
                 else:
                     self.metrics["cpu_stall_only_rounds"] += 1
-                newly_completed, consumed = coordinated(
-                    self.group, "CPU previous result", lambda:
+                newly_completed, consumed = self._run_stage(
+                    "CPU previous result", lambda:
                     self._consume_previous(previous, host, tensors, model_done))
                 completed.extend(newly_completed)
                 if host is not None:
@@ -269,6 +266,9 @@ class AsyncCPUCompactSpecScheduler(AsyncCompactSpecScheduler):
                 with open(os.path.join(self._result_dir, f"compact-metrics.rank{self.rank}.json"), "w") as out:
                     json.dump(self.metrics, out, indent=2)
             return sorted(completed, key=lambda r: r.request_id)
+        except BaseException:
+            self._abort_failed_tp_worker()
+            raise
         finally:
             self.compute_stream.synchronize()
             torch.cuda.current_stream(self.kv_pool.device).synchronize()

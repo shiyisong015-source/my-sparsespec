@@ -171,7 +171,7 @@ class SpecScheduler(BaseScheduler):
         all_kv_indptr = array.array("i", [0])
         #KV长度数组那请求存[3,1,4]batch中每个请求的kv长度
         kv_len_arr = array.array("i")
-        #按token存储[3,3,3,1,4,4,4,4]
+        # Per-request append lengths; compact phase views may omit cold KV.
         all_kv_len_arr = array.array("i")
 
         # for token-probs scatter，：把一次批量 forward 得到的草稿概率，分发到各请求自己的 draft_probs 缓冲。
@@ -229,7 +229,7 @@ class SpecScheduler(BaseScheduler):
             all_kv_indices.extend(request.kv_cache_ptr.indices)
             all_kv_indptr.append(all_kv_indptr[-1] + len(request.kv_cache_ptr.indices))
             kv_len_arr.append(request.len_loading_kv_cache)
-            all_kv_len_arr.append(request.len_kv_cache)
+            all_kv_len_arr.append(request.kv_cache_ptr.append_kv_length)
         nvtx.range_pop()
 
         # zero-forward caused by all STALL requests

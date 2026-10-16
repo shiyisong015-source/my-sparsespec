@@ -103,6 +103,11 @@ class FullCachePtr:
             self.kv_pool.free_page(page_index)
 
     @property
+    def append_kv_length(self) -> int:
+        """Sequence length used to locate appended KV within the page table."""
+        return self.len_kv_cache
+
+    @property
     def last_page_offset(self) -> int:
         return (self.len_kv_cache - 1) % self.page_size + 1
 

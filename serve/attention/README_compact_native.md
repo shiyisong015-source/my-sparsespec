@@ -87,8 +87,9 @@ CPU 活跃冷 KV 页预算按全部请求和一次 replacement 的上界设置�
   不对尚未记录的事件发出等待。
 - retire 延迟释放 KV 和 draft probability buffer，等待计算/控制消费者均完成且全部 TP rank 同意。
   如果页压力来自这些延迟释放页，只等待相关事件，不误报不可行。
-- TP2 rejection 使用独立 NCCL group，与计算流 token/probability broadcast 分离。
-  CPU 结果处理及 KV 事务仍按一致顺序用 Gloo 协调。
+- TP sampling/rejection 沿用原生各 rank 本地执行方式，不新增 token、概率表或
+  rejection 结果广播，也不创建专用 rejection NCCL group。各 rank 使用相同 seed，
+  并保持随机操作顺序和形状一致。KV 搬运及延迟回收的完成状态仍按一致顺序用 Gloo 协调。
 
 `cpu_pipeline_submissions`、`cpu_stall_only_rounds`、`cpu_updates_with_forward_inflight`、
 `deferred_retirements` 等指标保存到原 metrics 文件。`cpu_updates_with_forward_inflight`
@@ -100,6 +101,42 @@ CPU readback/result-update wall 时间可能重叠，不能相加当纯模型开
 
 上述完整扫描命令添加 `--async-cpu` 即可启用 CPU 流水；`--ratios .05` 可只运行该比例一次。
 CPU 与 GPU 内部仍然通过事件维护数据依赖，并非完全无同步。
+
+### 正常运行与 TP 诊断模式（2026-10-15）
+
+默认 `compact_debug_checks=False`：准入、metadata、上一轮结果处理直接在各 rank
+本地执行，不逐阶段交换错误状态，也不逐轮广播 ready 请求列表作一致性核对。
+原来的各 rank 独立 CPU 调度结构保持不变。常驻路径仍可能在首次准入和延迟回收时通信；
+实际 KV 事务的提交/回滚协调、全部 rank 就绪后提交搬运/回收、准入容量决定继续保留。
+
+诊断时 API 设置 `compact_debug_checks=True`，CLI 添加 `--compact_debug_checks`，
+扫描控制器添加 `--compact-debug-checks`，恢复逐阶段错误交换和 ready 列表核对。
+该开关须在所有 TP rank 上一致，独立于 Transformer debug 模式。
+
+TP 调度运行阶段发生未处理异常时，打印 rank 与原 traceback 后以非零状态立即退出该
+worker，由 torchrun 等外部进程管理器终止同组其他 worker。不在出错进程等待 CUDA
+stream、Graph 析构或通信组销毁，避免其他 rank 卡在 collective 时清理过程也一直等待。
+这不是异常恢复；调用方必须有整组进程管理能力，不能在失败的 TP 进程里继续推理。
+TP1 保持普通异常传播及清理路径。成功结束仍完整等待消费者、回收页并释放 Graph。
+
+### KV 追加长度 metadata
+
+`SpecScheduler` 首次收集 `all_kv_len_arr` 时读取 cache 的 `append_kv_length`，
+随后统一上传一次。原生 Full/Streaming/Pillar cache 返回已有的 `len_kv_cache`；
+Compact cache 返回 `len(indices)`，即 page-size-one 下当前物理阶段页表的长度。
+Compact metadata 分发不再重建或再次上传该数组。逻辑 RoPE 位置继续使用
+`len_kv_cache`，attention 读取长度继续使用 `len_loading_kv_cache`。
+
+### CPU 页表诊断快照
+
+常驻 verify 不再通过 `tuple(indices)` 复制完整 CPU 页表，也不在 rejection 后或 pack
+入口用完整前缀逐项比较。`freeze_verify_view()` 保留名称，只记录已有 verify epoch；
+阶段、完整长度、tail 回退范围和页 ownership 检查继续执行。rejection 只删除末尾页，
+pack/restore 通过现有阶段与事件依赖维护页序。绕过这些接口直接修改 indices 的同长度
+重排不再由完整 CPU 快照捕获。
+
+这项删除也适用于 TP 诊断模式；`compact_debug_checks` 只控制上述 TP 阶段/批次核对。
+attention/TopK 使用的实际 GPU 页表、GPU score snapshot 和搬运时必需的源页表仍保留。
 
 ## CUDA Graph（2026-10-15 新增适配）
 
@@ -139,7 +176,7 @@ compact 推理结束后显式等待 GPU 工作完成并 reset 两个 phase 的 G
 
 三个长度必须区分：`len_kv_cache` 是完整逻辑位置；`len(indices)` 是当前物理 append 页表长度；`len_loading_indices` 是 draft 可见长度。RoPE 使用逻辑位置，append 使用物理位置。`owned_pages` 是唯一 ownership 集合，不能用阶段页表代替。
 
-QKV/MLP/RoPE、原 attention/score/TopK 数学和输出采样/rejection 继续复用。保留混合 batch 密集前向及一活跃 chunked-prefill。TP 的 token 由 rank0 原 sampler 决定，在 broadcast 前统一 int32；每 rank 的 KV 选择可不同，但计数与生命周期一致。
+QKV/MLP/RoPE、原 attention/score/TopK 数学和输出采样/rejection 继续复用。保留混合 batch 密集前向及一活跃 chunked-prefill。TP 各 rank 本地调用原 sampler 和 rejection sampler，采样 token 按原生流程转为 int32；每 rank 的 KV 选择可不同，但输出 token、计数与生命周期须一致。
 
 ## 限制与预算
 

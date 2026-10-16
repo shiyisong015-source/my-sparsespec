@@ -8,7 +8,9 @@ ownership. Capacity only changes which ready requests join a mixed batch.
 import json
 import math
 import os
+import sys
 import time
+import traceback
 
 import torch
 import torch.distributed as dist
@@ -43,25 +45,6 @@ def coordinated(group, label, operation, rollback=None, *, timing=None):
     return result
 
 
-class _RankZeroRejection:
-    def __init__(self, scheduler, original):
-        self.scheduler, self.original = scheduler, original
-
-    def __call__(self, **kwargs):
-        scheduler = self.scheduler
-        result = coordinated(scheduler.group, "rejection", lambda:
-                             self.original(**kwargs) if scheduler.rank == 0 else
-                             torch.empty((len(kwargs["num_draft_tokens"]), kwargs["max_spec_len"] + 1),
-                                         dtype=torch.int32, device=scheduler.kv_pool.device))
-        if scheduler.group is not None:
-            rejection_group = getattr(scheduler, "rejection_group", None)
-            if rejection_group is None:
-                dist.broadcast(result, src=0)
-            else:
-                dist.broadcast(result, src=0, group=rejection_group)
-        return result
-
-
 class CompactSpecScheduler(SpecScheduler):
     def __init__(self, kv_pool, model, **kwargs):
         if kwargs.get("async_cpu"):
@@ -75,13 +58,13 @@ class CompactSpecScheduler(SpecScheduler):
         super().__init__(kv_pool, model, **kwargs)
         self.group = kwargs.get("compact_control_group")
         self.rank = dist.get_rank() if self.group is not None else 0
+        self.debug_checks = kwargs.get("compact_debug_checks", False)
         if kwargs["tp_ranks"] > 1 and self.group is None:
             raise ValueError("TP compact execution requires a Gloo control group")
         self.cpu_capacity = kwargs["compact_cpu_pages"]
         if self.cpu_capacity <= 0:
             raise ValueError("Positive compact pinned CPU page budget required")
         self.validate_moves = kwargs.get("compact_validate_moves", False)
-        self.rejection_sampler = _RankZeroRejection(self, self.rejection_sampler)
         self.metrics = dict(forwards=0, request_verify_rounds=0, verify_forwards=0,
                             migrations=0, restores=0, admission_waits=0, capacity_waits=0,
                             max_actual_batch=0, batch_sum=0, mixed_forwards=0,
@@ -94,6 +77,31 @@ class CompactSpecScheduler(SpecScheduler):
         self._result_dir = kwargs.get("profiler_result_dir")
         if self._result_dir:
             os.makedirs(self._result_dir, exist_ok=True)
+
+    def _run_stage(self, label, operation):
+        """Normal stages run locally; optional diagnostics exchange errors."""
+        if self.debug_checks:
+            return coordinated(self.group, label, operation)
+        return operation()
+
+    def _check_ready_batch(self, ids):
+        if self.debug_checks and ids != self._broadcast(ids):
+            raise RuntimeError("TP ready batches diverged")
+
+    def _abort_failed_tp_worker(self):
+        """A failed TP execution is fatal; never wait on peer GPU work here.
+
+        Called inside an exception handler, before stream/Graph destructors.
+        The launcher (torchrun) observes this nonzero exit and stops peers.
+        TP1 retains the ordinary exception and cleanup path.
+        """
+        if self.group is not None:
+            try:
+                print(f"Fatal compact execution error on TP rank {self.rank}", file=sys.stderr)
+                traceback.print_exc()
+                sys.stderr.flush()
+            finally:
+                os._exit(1)
 
     def _timed_transfer(self, direction, begin, commit, rollback):
         """Measure existing host waits, with no additional CUDA synchronization.
@@ -252,11 +260,7 @@ class CompactSpecScheduler(SpecScheduler):
             raise MemoryError("No ready request fits the reserved native metadata/transfer capacity")
         self.active_requests, self.offload_requests = chosen, waiting
         self.metrics["capacity_waits"] += len(waiting)
-        if self.group is not None:
-            ids = [r.request_id for r in chosen]
-            expected = self._broadcast(ids)
-            if ids != expected:
-                raise RuntimeError("TP scheduler states diverged before forward")
+        self._check_ready_batch([r.request_id for r in chosen])
 
     def prepare_forward_inputs(self):
         for request in self.active_requests:
@@ -270,23 +274,10 @@ class CompactSpecScheduler(SpecScheduler):
         return super().prepare_forward_inputs()
 
     def _sample(self, logits, count):
-        def sample():
-            if self.rank == 0:
-                return self.sampler(logits, self.sampling_metadata, count)
-            return (torch.empty(count, dtype=torch.int32, device=logits.device),
-                    torch.zeros((count, logits.shape[1]), dtype=torch.float32, device=logits.device))
-        tokens, probs = coordinated(self.group, "sampling", sample)
-        # Greedy returns int64 and the original stochastic kernel returns
-        # int32. NCCL requires every rank to agree before the broadcast.
-        tokens = tokens.to(torch.int32)
-        if self.group is not None:
-            dist.broadcast(tokens, src=0)
-            if self.temperature == 0:
-                if self.rank != 0:
-                    probs.scatter_(1, tokens.long()[:, None], 1.)
-            else:
-                dist.broadcast(probs, src=0)
-        return tokens, probs
+        # Match the native scheduler: every TP rank samples the gathered
+        # logits locally, with the same seed and random-operation sequence.
+        tokens, probs = self.sampler(logits, self.sampling_metadata, count)
+        return tokens.to(torch.int32), probs
 
     def update_requests(self, *args, **kwargs):
         completed = super().update_requests(*args, **kwargs)
@@ -320,7 +311,7 @@ class CompactSpecScheduler(SpecScheduler):
         try:
             while pending_requests or self.active_requests or self.offload_requests:
                 self.step_id += 1
-                coordinated(self.group, "admission", lambda: self.admit_requests(pending_requests))
+                self._run_stage("admission", lambda: self.admit_requests(pending_requests))
                 if not self.active_requests:
                     self.wait_for_ready_requests()
                     continue
@@ -329,14 +320,14 @@ class CompactSpecScheduler(SpecScheduler):
                     host, tensors = self.prepare_forward_inputs()
                     self.model.register_input(**tensors)
                     return host, tensors
-                host, tensors = coordinated(self.group, "forward metadata", setup)
+                host, tensors = self._run_stage("forward metadata", setup)
                 self._record_peak()
                 logits = self.model(**tensors)
                 tokens, probs = self._sample(logits, len(host["token_ids"]))
                 del logits
                 host.update(self.kv_pool.output_snapshot(host))
                 done = torch.cuda.current_stream(self.kv_pool.device).record_event()
-                coordinated(self.group, "whole-forward completion", done.synchronize)
+                self._run_stage("whole-forward completion", done.synchronize)
                 for request in self.active_requests:
                     self._last_served[request.request_id] = self.step_id
                 newly_completed = self.update_requests(host["token_indptr"], tokens, probs, host)
@@ -362,6 +353,9 @@ class CompactSpecScheduler(SpecScheduler):
                 with open(os.path.join(self._result_dir, f"compact-metrics.rank{self.rank}.json"), "w") as out:
                     json.dump(self.metrics, out, indent=2)
             return sorted(completed, key=lambda r: r.request_id)
+        except BaseException:
+            self._abort_failed_tp_worker()
+            raise
         finally:
             # All ordinary exits wait before freeing mapped CPU and pool pages.
             # A CUDA fault is fatal and is deliberately not advertised as recoverable.

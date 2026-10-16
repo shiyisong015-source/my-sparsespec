@@ -194,9 +194,12 @@ def run_inference(
     compact_pool_pages: int = None,
     compact_cpu_pages: int = None,
     compact_async_transfers: bool = False,
+    compact_debug_checks: bool = False,
 ):
     if compact_async_transfers and kv_cache != "compact":
         raise ValueError("compact_async_transfers requires kv_cache='compact'")
+    if compact_debug_checks and kv_cache != "compact":
+        raise ValueError("compact_debug_checks requires kv_cache='compact'")
     if kv_cache == "compact":
         if debug or perf_sim or vanilla_attn or step_log_path is not None:
             raise ValueError("Native compact requires native attention; step tracing is not supported")
@@ -371,6 +374,7 @@ def run_inference(
         "seed": seed,
         "compact_cpu_pages": compact_cpu_pages,
         "compact_async_transfers": compact_async_transfers,
+        "compact_debug_checks": compact_debug_checks,
     }
 
     additional_args = {
@@ -411,8 +415,6 @@ def run_inference(
             if kv_cache == "compact":
                 import torch.distributed as dist
                 job_args["compact_control_group"] = dist.new_group(backend="gloo") if tp_ranks > 1 else None
-                if async_cpu and tp_ranks > 1:
-                    job_args["compact_rejection_group"] = dist.new_group(backend="nccl")
 
             # init kv_cache_class
             kv_cache_class = dispatch_str_to_cache_ptr(kv_cache)
@@ -731,6 +733,8 @@ if __name__ == "__main__":
                            help="Pinned CPU cold slots per TP rank, including old/new overlap")
     argparser.add_argument("--compact_async_transfers", action="store_true",
                            help="On-demand compact KV transfers on a separate stream; combine with --async_cpu for CPU/GPU pipelining")
+    argparser.add_argument("--compact_debug_checks", action="store_true",
+                           help="Enable per-stage TP error exchange and ready-batch consistency diagnostics")
     argparser.add_argument("--temperature", type=float, default=0.0)
 
     argparser.add_argument("--perf_sim", action="store_true")
@@ -792,4 +796,5 @@ if __name__ == "__main__":
         compact_pool_pages=args.compact_pool_pages,
         compact_cpu_pages=args.compact_cpu_pages,
         compact_async_transfers=args.compact_async_transfers,
+        compact_debug_checks=args.compact_debug_checks,
     )

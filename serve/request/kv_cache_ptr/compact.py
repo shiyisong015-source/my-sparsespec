@@ -66,12 +66,17 @@ class CompactCachePtr(PillarCachePtr):
         self.cold_cpu = None
         self.recent_count = 0
         self.epoch = 0
-        self.verify_pages = None
         self.verify_epoch = None
         self.needs_pack = False
         self._resident_selected_at = None
         self._pending = None
         self._closed = False
+
+    @property
+    def append_kv_length(self) -> int:
+        # Compact pages have size one; the phase view can omit CPU-resident KV.
+        # RoPE still uses len_kv_cache, independently of this append length.
+        return len(self.indices)
 
     @property
     def cold_count(self):
@@ -114,14 +119,18 @@ class CompactCachePtr(PillarCachePtr):
         return num_tokens
 
     def freeze_verify_view(self):
+        """Mark the verify epoch without copying the CPU page table.
+
+        Page order is maintained by phase transitions: rejection only removes
+        tail pages, and pack/restore cannot mutate an in-flight verify view.
+        """
         if (self.phase not in ("full", "verify", "resident") or self._pending is not None
                 or len(self.indices) != self.len_kv_cache):
             raise RuntimeError("Verify requires all cold restored before metadata capture")
-        self.verify_pages = tuple(self.indices)
         self.verify_epoch = self.epoch
 
     def retract_tokens(self, num_tokens):
-        if (self.verify_pages is None or self.verify_epoch != self.epoch
+        if (self.verify_epoch != self.epoch
                 or not 0 <= num_tokens <= len(self.tail_pages)):
             raise RuntimeError("Rejection may only retract this verify's chronological tail")
         if num_tokens:
@@ -131,11 +140,9 @@ class CompactCachePtr(PillarCachePtr):
             self._release(rejected)
             self.len_kv_cache -= num_tokens
             self.len_loading_indices -= num_tokens
-        if tuple(self.indices) != self.verify_pages[:self.len_kv_cache]:
-            raise RuntimeError("Score page order changed before selection")
 
     def get_select_metadata(self, **config):
-        if self.verify_pages is None or self.verify_epoch != self.epoch:
+        if self.verify_epoch != self.epoch:
             raise RuntimeError("Selection requires the frozen current verify epoch")
         recent = min(self.len_kv_cache, config["num_accepted_tokens"] + 1)
         budget = max(config.get("num_min_budget", 128),
@@ -161,7 +168,7 @@ class CompactCachePtr(PillarCachePtr):
         self.phase, self.needs_pack = "resident", False
         self.hot_pages, self.restored_pages, self.tail_pages = (), (), []
         self.cold_cpu = None
-        self.verify_pages = self.verify_epoch = None
+        self.verify_epoch = None
 
     def prepare_resident_offload(self):
         """Freeze a current full view using the last selection and new tail.
@@ -179,7 +186,7 @@ class CompactCachePtr(PillarCachePtr):
         self.recent_count += added
         if self.len_selected_indices_gpu + self.recent_count != self.len_loading_indices:
             raise RuntimeError("Resident sparse view does not cover selected + recent/tail")
-        self.verify_pages, self.verify_epoch = tuple(self.indices), self.epoch
+        self.verify_epoch = self.epoch
         self.needs_pack = True
 
     def begin_restore(self):
@@ -217,8 +224,8 @@ class CompactCachePtr(PillarCachePtr):
     def begin_pack(self, *, validate=False):
         if (not self.needs_pack or self._pending is not None
                 or self.verify_epoch != self.epoch
-                or tuple(self.indices) != self.verify_pages[:self.len_kv_cache]):
-            raise RuntimeError("Pack requires completed rejection/selection on the frozen verify view")
+                or len(self.indices) != self.len_kv_cache):
+            raise RuntimeError("Pack requires completed rejection/selection in the current verify epoch")
         physical = self.kv_pool._physical_mem_gpu
         full = torch.tensor(tuple(self.indices), dtype=torch.int32, device=physical.device)
         plan = partition_pages(full, self.selected_indices_buffer_gpu,
@@ -263,7 +270,7 @@ class CompactCachePtr(PillarCachePtr):
             destinations = torch.tensor(self.hot_pages[:count], device=self.kv_pool.device, dtype=torch.int32)
             self.selected_indices_buffer_gpu[..., :count].copy_(destinations)
         self.phase, self.needs_pack, self._pending = "hot", False, None
-        self.verify_pages = self.verify_epoch = None
+        self.verify_epoch = None
         self.epoch += 1
 
     def abort_transfer(self, transfer):
@@ -293,13 +300,8 @@ class CompactCachePtr(PillarCachePtr):
 
     @classmethod
     def dispatch_prepare_fwd_metadata(cls, **kwargs):
-        host, tensors = kwargs["input_metadata"], kwargs["input_metadata_tensors"]
+        host = kwargs["input_metadata"]
         requests = kwargs["active_requests"]
-        # Scheduler's logical offsets remain unchanged for RoPE. The append
-        # kernel separately needs positions within the physical phase page table.
-        physical_lengths = array.array("i", (len(r.kv_cache_ptr.indices) for r in requests))
-        host["all_kv_len_arr"] = physical_lengths
-        tensors["all_kv_len_arr"] = torch.tensor(physical_lengths, dtype=torch.int32, device=kwargs["device"])
         draft_total = sum(r.len_loading_kv_cache for r in requests if r.status == Request.ReqExecType.DRAFT)
         verify_total = sum(r.len_loading_kv_cache for r in requests if r.status == Request.ReqExecType.VERIFY)
         if draft_total >= cls.MAX_TOTAL_DRAFT_KV_LEN or verify_total >= cls.MAX_TOTAL_VERIFY_KV_LEN:

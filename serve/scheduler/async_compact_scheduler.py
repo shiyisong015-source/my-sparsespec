@@ -238,8 +238,7 @@ class AsyncCompactSpecScheduler(CompactSpecScheduler):
                 chosen.append(request)
                 alloc, drafts, verifies, queries = alloc + append, drafts + draft, verifies + verify, queries + query
         ids = [r.request_id for r in chosen]
-        if ids != self._broadcast(ids):
-            raise RuntimeError("TP ready batches diverged")
+        self._check_ready_batch(ids)
         self.active_requests = chosen
         chosen_ids = set(ids)
         self.offload_requests = [r for r in self._requests.values() if r.request_id not in chosen_ids]

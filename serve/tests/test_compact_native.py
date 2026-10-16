@@ -82,10 +82,12 @@ class CPUOwnership(unittest.TestCase):
         ptr.allocate_tokens(1)
         ptr.allocate_tokens(1)
         self.assertEqual((ptr.len_kv_cache, len(ptr.indices), ptr.len_loading_indices), (14, 14, 14))
+        before_rejection = tuple(ptr.indices)
         ptr.freeze_verify_view()
         ptr.retract_tokens(1)
         self.assertEqual(ptr.owned_pages - initial, set(ptr.tail_pages))
-        self.assertEqual(len(ptr.verify_pages), 14)
+        self.assertEqual(ptr.verify_epoch, ptr.epoch)
+        self.assertEqual(tuple(ptr.indices), before_rejection[:-1])
         self.assertEqual(len(ptr.indices), 13)
         with self.assertRaises(RuntimeError):
             ptr.retract_tokens(2)
@@ -93,22 +95,75 @@ class CPUOwnership(unittest.TestCase):
         ptr.close()
         self.assertEqual(pool.num_free_pages, pool.capacity)
 
-    def test_physical_append_length_does_not_replace_logical_rope_offset(self):
+    def test_resident_verification_does_not_iterate_the_cpu_page_table(self):
+        class NoIterationPages(array.array):
+            def __iter__(self):
+                raise AssertionError("Full CPU page-table traversal during verification")
+
         pool, ptr = self.new_ptr()
-        ptr.indices = array.array("i", ptr.indices[:5])
-        ptr.len_loading_indices = 5
-        request = Request(list(range(13)), 20)
-        request.status = Request.ReqExecType.DRAFT
-        request.kv_cache_ptr = ptr
-        host = dict(token_ids=array.array("i", [12]), token_indptr=array.array("i", [0, 1]))
-        tensors = {"pos_offsets": torch.tensor([12], dtype=torch.int32)}
-        with patch.object(PillarCachePtr, "dispatch_prepare_fwd_metadata"):
-            LocalPtr.dispatch_prepare_fwd_metadata(input_metadata=host, input_metadata_tensors=tensors,
-                                                  active_requests=[request], device="cpu")
-        self.assertEqual(tensors["all_kv_len_arr"].tolist(), [5])
-        self.assertEqual(tensors["pos_offsets"].tolist(), [12])
+        ptr.indices = NoIterationPages("i", ptr.indices)
+        ptr.freeze_verify_view()
+        ptr.retract_tokens(0)
+        ptr.get_select_metadata(num_min_budget=5, budget_ratio=.1, num_accepted_tokens=1)
+        ptr.keep_full_resident()
+        self.assertEqual(ptr.phase, "resident")
+        self.assertIsNone(ptr.verify_epoch)
         ptr.close()
         self.assertEqual(pool.num_free_pages, pool.capacity)
+
+    def test_physical_append_length_does_not_replace_logical_rope_offset(self):
+        # The legacy scheduler creates a CUDA stream at import time.
+        with patch("torch.cuda.Stream", return_value=SimpleNamespace()):
+            from serve.scheduler.spec_scheduler import SpecScheduler
+
+        # Exercise the real collector for both a full resident view and a view
+        # omitting cold pages, alongside an original FullCachePtr prefill.
+        for physical_count in (12, 5):
+            with self.subTest(physical_count=physical_count):
+                pool, ptr = self.new_ptr()
+                ptr.indices = array.array("i", ptr.indices[:physical_count])
+                ptr.len_loading_indices = 3
+                draft = Request(list(range(13)), 20)
+                draft.status = Request.ReqExecType.DRAFT
+                draft.kv_cache_ptr = ptr
+                draft.draft_probs = torch.empty((8, pool.vocab_size))
+                prefill = Request([21, 22, 23], 20)
+                prefill.kv_cache_ptr = FullCachePtr(pool)
+                scheduler = SpecScheduler.__new__(SpecScheduler)
+                scheduler.active_requests = [draft, prefill]
+                scheduler.model = SimpleNamespace(device="cpu")
+                scheduler._args = {"chunk_size": 256}
+                scheduler.spec_cache_class = LocalPtr
+                scheduler.spec_cache_args = {}
+                uploaded_lengths = []
+
+                def native_dispatch(**kwargs):
+                    host = kwargs["input_metadata"]
+                    tensors = kwargs["input_metadata_tensors"]
+                    uploaded_lengths.append(tensors["all_kv_len_arr"])
+                    self.assertEqual(list(host["all_kv_len_arr"]), [physical_count + 1, 3])
+                    # The one common upload already contains the right values.
+                    self.assertEqual(tensors["all_kv_len_arr"].tolist(), [physical_count + 1, 3])
+
+                try:
+                    with patch("serve.scheduler.spec_scheduler.nvtx.range_push"), \
+                         patch("serve.scheduler.spec_scheduler.nvtx.range_pop"), \
+                         patch.object(PillarCachePtr, "dispatch_prepare_fwd_metadata", side_effect=native_dispatch), \
+                         patch("serve.scheduler.spec_scheduler.torch.frombuffer", wraps=torch.frombuffer) as uploads, \
+                         patch("serve.request.kv_cache_ptr.compact.torch.tensor",
+                               side_effect=AssertionError("Redundant metadata tensor creation")):
+                        host, tensors = scheduler.prepare_forward_inputs()
+                    length_uploads = [call for call in uploads.call_args_list
+                                      if call.args[0] is host["all_kv_len_arr"]]
+                    self.assertEqual(len(length_uploads), 1)
+                    self.assertIs(tensors["all_kv_len_arr"], uploaded_lengths[0])
+                    self.assertEqual(tensors["pos_offsets"].tolist(), [12, 0])
+                    self.assertEqual(tensors["kv_len_arr"].tolist(), [4, 3])
+                    self.assertEqual((draft.len_kv_cache, prefill.len_kv_cache), (13, 3))
+                finally:
+                    ptr.close()
+                    prefill.retire()
+                self.assertEqual(pool.num_free_pages, pool.capacity)
 
     def test_recent_budget_and_epoch_guards(self):
         pool, ptr = self.new_ptr()
@@ -270,6 +325,7 @@ class CPUCapacity(unittest.TestCase):
         scheduler.cpu_capacity = 40000
         scheduler.max_batch_size = 4
         scheduler.group, scheduler.rank = None, 0
+        scheduler.debug_checks = False
         scheduler._last_served = {}
         scheduler._args = dict(chunk_size=256)
         scheduler.metrics = dict(admission_waits=0, capacity_waits=0, max_live_requests=0)
@@ -365,31 +421,34 @@ class CPUCapacity(unittest.TestCase):
         scheduler.admit_requests([])
         self.assertEqual(scheduler.active_requests[0].request_id, 1)
 
-    def test_tp_sampling_broadcast_dtype_for_greedy_and_stochastic(self):
+    def test_tp_sampling_uses_native_local_results_without_communication(self):
         module = "serve.scheduler.compact_scheduler"
         for temperature, sampler_dtype in ((0., torch.int64), (.65, torch.int32)):
             for rank in (0, 1):
                 scheduler = self.scheduler()
                 scheduler.group, scheduler.rank = object(), rank
                 scheduler.temperature, scheduler.sampling_metadata = temperature, None
-                scheduler.sampler = lambda *args: (
-                    torch.tensor([2, 3], dtype=sampler_dtype), torch.zeros(2, 5))
-                calls = []
+                local_probs = torch.zeros(2, 5)
+                local_probs[0, 2], local_probs[1, 3] = .25, .75
+                sampled = []
 
-                def broadcast(tensor, src):
-                    calls.append(tensor.dtype)
-                    if tensor.ndim == 1:
-                        self.assertEqual(tensor.dtype, torch.int32)
-                        tensor.copy_(torch.tensor([2, 3], dtype=torch.int32))
+                def sampler(*args):
+                    sampled.append(args)
+                    return torch.tensor([rank, rank], dtype=sampler_dtype), local_probs
 
-                with patch(f"{module}.coordinated", side_effect=lambda group, label, op: op()), \
-                     patch(f"{module}.dist.broadcast", side_effect=broadcast):
-                    tokens, probs = scheduler._sample(torch.zeros(2, 5), 2)
+                scheduler.sampler = sampler
+                logits = torch.zeros(2, 5)
+                with patch(f"{module}.coordinated", side_effect=AssertionError("sampling coordination")), \
+                     patch(f"{module}.dist.broadcast", side_effect=AssertionError("sampling broadcast")):
+                    tokens, probs = scheduler._sample(logits, 2)
                 self.assertEqual(tokens.dtype, torch.int32)
-                self.assertEqual(calls, [torch.int32] + ([torch.float32] if temperature else []))
-                if rank == 1 and temperature == 0:
-                    self.assertEqual(probs.sum().item(), 2.)
-                    self.assertEqual(probs[0, 2].item(), 1.)
+                self.assertEqual(tokens.tolist(), [rank, rank])
+                self.assertEqual(len(sampled), 1)
+                self.assertIs(sampled[0][0], logits)
+                self.assertEqual(sampled[0][2], 2)
+                self.assertIs(probs, local_probs)
+                self.assertEqual(probs[0, 2].item(), .25)
+                self.assertEqual(probs[1, 3].item(), .75)
 
     def test_constructor_rejects_unsafe_recent_and_score_tile(self):
         scheduler = self.scheduler()
@@ -426,6 +485,63 @@ class CPUCapacity(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     prepare(status, length, query, count)
             self.assertEqual(original.call_count, 2)
+
+
+class CPUDiagnostics(unittest.TestCase):
+    def test_release_stages_do_not_exchange_errors_and_propagate_local_failure(self):
+        scheduler = CPUCapacity.scheduler()
+        scheduler.group = object()
+        with patch("serve.scheduler.compact_scheduler.coordinated",
+                   side_effect=AssertionError("unexpected stage collective")):
+            self.assertEqual(scheduler._run_stage("metadata", lambda: 42), 42)
+            def fail():
+                raise ValueError("local metadata failure")
+            with self.assertRaisesRegex(ValueError, "local metadata failure"):
+                scheduler._run_stage("metadata", fail)
+
+    def test_diagnostic_stage_detects_remote_error(self):
+        scheduler = CPUCapacity.scheduler()
+        scheduler.group, scheduler.debug_checks = object(), True
+        def exchange(errors, local, group):
+            self.assertIsNone(local)
+            errors[:] = [None, "ValueError: remote metadata failure"]
+        module = "serve.scheduler.compact_scheduler"
+        with patch(f"{module}.dist.get_world_size", return_value=2), \
+             patch(f"{module}.dist.all_gather_object", side_effect=exchange):
+            with self.assertRaisesRegex(RuntimeError, "remote metadata failure"):
+                scheduler._run_stage("metadata", lambda: 42)
+
+    def test_ready_batch_check_is_optional_and_detects_divergence(self):
+        scheduler = CPUCapacity.scheduler()
+        scheduler.group = object()
+        with patch.object(scheduler, "_broadcast", side_effect=AssertionError("unexpected broadcast")):
+            scheduler._check_ready_batch([0, 1])
+        scheduler.debug_checks = True
+        with patch.object(scheduler, "_broadcast", return_value=[1, 0]):
+            with self.assertRaisesRegex(RuntimeError, "TP ready batches diverged"):
+                scheduler._check_ready_batch([0, 1])
+
+    def test_tp_failure_prints_traceback_and_exits_without_cuda_cleanup(self):
+        import io
+        scheduler = CPUCapacity.scheduler()
+        scheduler.group, scheduler.rank = object(), 1
+        error_log = io.StringIO()
+        module = "serve.scheduler.compact_scheduler"
+        with patch(f"{module}.sys.stderr", error_log), \
+             patch(f"{module}.os._exit", side_effect=SystemExit(1)) as abort, \
+             patch("torch.cuda.synchronize", side_effect=AssertionError("CUDA wait during failure")):
+            try:
+                raise ValueError("injected worker failure")
+            except ValueError:
+                with self.assertRaises(SystemExit):
+                    scheduler._abort_failed_tp_worker()
+        abort.assert_called_once_with(1)
+        self.assertIn("TP rank 1", error_log.getvalue())
+        self.assertIn("ValueError: injected worker failure", error_log.getvalue())
+        scheduler.group = None
+        with patch(f"{module}.os._exit") as abort:
+            scheduler._abort_failed_tp_worker()
+        abort.assert_not_called()
 
 
 class CPUAsyncTransfers(unittest.TestCase):

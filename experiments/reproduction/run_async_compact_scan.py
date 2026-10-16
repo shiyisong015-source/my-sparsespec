@@ -38,6 +38,8 @@ def main():
                         help="Enable one-round CPU/GPU pipelining in addition to async KV")
     parser.add_argument("--cuda-graph", action="store_true",
                         help="Capture/replay native compact model forwards; transfers stay outside graphs")
+    parser.add_argument("--compact-debug-checks", action="store_true",
+                        help="Enable per-stage TP error exchange and ready-batch diagnostics")
     parser.add_argument("--ratios", type=float, choices=[.05, .10, .15], nargs="+",
                         default=[.05, .10, .15], help="Run each requested ratio once")
     args = parser.parse_args()
@@ -68,7 +70,8 @@ def main():
                  reference_payload=str(reference_path),
                  reference_sha256=hashlib.sha256(reference_path.read_bytes()).hexdigest(),
                  scope=f"on-demand async KV, {'CUDA Graph' if args.cuda_graph else 'eager'}, one run per ratio",
-                 async_cpu=args.async_cpu, cuda_graph=args.cuda_graph)
+                 async_cpu=args.async_cpu, cuda_graph=args.cuda_graph,
+                 compact_debug_checks=args.compact_debug_checks)
     active = {}
 
     def launch(pair, ratio, inventory):
@@ -76,7 +79,8 @@ def main():
         case.mkdir()
         config = dict(kwargs, kv_cache="compact", compact_async_transfers=True,
                       compact_cpu_pages=cpu_pages, budget_ratio=ratio,
-                      cuda_graph=args.cuda_graph, async_cpu=args.async_cpu)
+                      cuda_graph=args.cuda_graph, async_cpu=args.async_cpu,
+                      compact_debug_checks=args.compact_debug_checks)
         save(case / "worker-payload.json", dict(output=str(case), requests=rows,
                                                 output_caps=caps, kwargs=config))
         command = [sys.executable, "-m", "torch.distributed.run", "--standalone",
@@ -100,7 +104,8 @@ def main():
                     repeats=1, differences_from_reference=dict(
                         compact_async_transfers=True, compact_cpu_pages=cpu_pages,
                         budget_ratio=ratio, async_cpu=args.async_cpu,
-                        cuda_graph=args.cuda_graph))
+                        cuda_graph=args.cuda_graph,
+                        compact_debug_checks=args.compact_debug_checks))
         save(case / "launch.json", item)
         state["cases"][case.name] = item
         active[pair] = (process, log, case, item)
