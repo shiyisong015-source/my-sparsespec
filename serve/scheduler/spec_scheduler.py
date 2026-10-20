@@ -108,6 +108,8 @@ class SpecScheduler(BaseScheduler):
             request.initial_idx = request.cur_spec_idx
 
     def is_request_complete(self, request: Request, check_idx=-1) -> bool:
+        if getattr(request, "replaying", False):
+            return False
         # sanity-check
         assert check_idx == -1 or self.async_on == True
         if len(request.token_ids) + check_idx < 0:
@@ -136,7 +138,7 @@ class SpecScheduler(BaseScheduler):
             ):
                 return True
             # Check for EOS token in last spec_stride+1 tokens
-            for i in range(self.spec_stride + 1, 0, -1):
+            for i in range(getattr(request, "last_verify_tokens", self.spec_stride + 1), 0, -1):
                 if len(request.token_ids) - request.len_input < i:
                     break
                 if request.token_ids[-i] in self.eos_token_id:
@@ -184,17 +186,31 @@ class SpecScheduler(BaseScheduler):
             # Handle verification mode specially
             if request.status == Request.ReqExecType.VERIFY:
                 # include bonus token
-                num_tokens = self.spec_stride + 1 - request.initial_idx #initial_idx是为了分配不同的起点，错开verify，避免集中验证
-                request.kv_cache_ptr.allocate_tokens(1) #只有最后生成的d4尚无KV槽位。
+                planned = getattr(request, "scheduled_tokens", None)
+                num_tokens = (self.spec_stride + 1 - request.initial_idx
+                              if planned is None else planned)
+                if num_tokens != request.len_draft_probs + 1:
+                    raise RuntimeError("Verify plan does not match retained draft probabilities")
+                rebuilding = getattr(request, "rebuild_verify", False)
+                request.kv_cache_ptr.allocate_tokens(num_tokens if rebuilding else 1)
+                if rebuilding:
+                    request.kv_cache_ptr, _ = self.spec_cache_class.from_kv_cache(
+                        request.kv_cache_ptr, **self.spec_cache_args)
+                    request.kv_cache_ptr.mark_replayed_verify_tail(num_tokens)
+                    request.rebuild_verify = False
+                request.last_verify_tokens = num_tokens
             elif request.status in (
                 Request.ReqExecType.DRAFT,
                 Request.ReqExecType.NORMAL,
             ):
                 # chunked prefill
-                num_tokens = min(
-                    request.len_token_ids - request.len_kv_cache,
-                    self._args["chunk_size"],
-                )
+                remaining = (request.replay_target - request.len_kv_cache
+                             if getattr(request, "replaying", False)
+                             else request.len_token_ids - request.len_kv_cache)
+                planned = getattr(request, "scheduled_tokens", None)
+                num_tokens = min(remaining, self._args["chunk_size"]) if planned is None else planned
+                if not 0 < num_tokens <= min(remaining, self._args["chunk_size"]):
+                    raise RuntimeError("Scheduled token count exceeds the request's available input")
                 #修改了len_kv_cache后，必须分配kv槽位，否则会报错
                 request.kv_cache_ptr.allocate_tokens(num_tokens)
                 if request.status == Request.ReqExecType.DRAFT:

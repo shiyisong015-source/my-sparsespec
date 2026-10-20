@@ -106,7 +106,10 @@ def run_spec_scheduler(
     logger.info(f"Running SpecScheduler with args: {args}")
 
     if args["kv_cache"] == "compact":
-        if args.get("compact_async_transfers"):
+        if args.get("compact_dynamic_admission"):
+            from serve.scheduler.dynamic_compact_scheduler import DynamicCompactSpecScheduler
+            worker = DynamicCompactSpecScheduler(kv_pool, model, **args)
+        elif args.get("compact_async_transfers"):
             if args.get("async_cpu"):
                 from serve.scheduler.async_cpu_compact_scheduler import AsyncCPUCompactSpecScheduler
                 worker = AsyncCPUCompactSpecScheduler(kv_pool, model, **args)
@@ -195,19 +198,41 @@ def run_inference(
     compact_cpu_pages: int = None,
     compact_async_transfers: bool = False,
     compact_debug_checks: bool = False,
+    compact_dynamic_admission: bool = False,
+    max_num_batched_tokens: int = None,
+    compact_early_verify_length: int = None,
+    compact_cpu_admit_fraction: float = 1.,
+    compact_selected_capacity: int = 6 * 1024,
 ):
+    if compact_dynamic_admission:
+        if kv_cache != "compact" or not compact_async_transfers or not async_cpu:
+            raise ValueError("Dynamic admission requires compact KV with CPU and transfer async enabled")
+        if (type(max_num_batched_tokens) is not int
+                or not spec_stride + 1 <= max_num_batched_tokens < FullCachePtr._MAX_NNZ):
+            raise ValueError("Set k+1 <= max_num_batched_tokens < 32768 for dynamic admission")
+        if (compact_early_verify_length is not None and
+                (type(compact_early_verify_length) is not int or
+                 not 1 <= compact_early_verify_length <= spec_stride)):
+            raise ValueError("compact_early_verify_length must be between 1 and k")
+        if not math.isfinite(compact_cpu_admit_fraction) or not 0 < compact_cpu_admit_fraction <= 1:
+            raise ValueError("compact_cpu_admit_fraction must be in (0,1]")
+    elif max_num_batched_tokens is not None or compact_early_verify_length is not None:
+        raise ValueError("Token budget and early verify options require compact_dynamic_admission")
     if compact_async_transfers and kv_cache != "compact":
         raise ValueError("compact_async_transfers requires kv_cache='compact'")
     if compact_debug_checks and kv_cache != "compact":
         raise ValueError("compact_debug_checks requires kv_cache='compact'")
     if kv_cache == "compact":
+        if (type(compact_selected_capacity) is not int
+                or not num_min_budget < compact_selected_capacity <= PillarCachePtr.MAX_TOTAL_DRAFT_KV_LEN):
+            raise ValueError("Require min_budget < compact_selected_capacity <= total draft index capacity")
         if debug or perf_sim or vanilla_attn or step_log_path is not None:
             raise ValueError("Native compact requires native attention; step tracing is not supported")
         if async_cpu and not compact_async_transfers:
             raise ValueError("Compact async_cpu requires compact_async_transfers=True")
         if (spec_stride < 1 or not math.isfinite(budget_ratio) or not 0 < budget_ratio <= 1
-                or not spec_stride + 2 <= num_min_budget < 6144):
-            raise ValueError("Native compact requires k>=1, 0<r<=1, k+2<=min_budget<6144")
+                or not spec_stride + 2 <= num_min_budget < compact_selected_capacity):
+            raise ValueError("Native compact requires k>=1, 0<r<=1, k+2<=min_budget<selected capacity")
         if max_batch_size < 1 or max_batch_size >= FullCachePtr._MAX_BATCH_SIZE or chunk_size < 1:
             raise ValueError("Invalid native compact batch/chunk capacity")
     if kv_cache == "packed":
@@ -243,8 +268,9 @@ def run_inference(
     # Use model_config_name if provided, otherwise use model_name
     config_name = model_name
     model_config = ModelArgs.from_name(config_name)
-    if kv_cache == "compact" and (spec_stride + 1) * model_config.num_qo_heads // model_config.num_kv_heads > 64:
-        raise ValueError("Native score kernel supports GQA*(spec_stride+1)<=64")
+    if (kv_cache == "compact" and (spec_stride + 1) * model_config.num_qo_heads
+            // model_config.num_kv_heads > PillarCachePtr.MAX_PACKED_SCORE_QO):
+        raise ValueError("Verification exceeds selection score query capacity")
     # Auto-resolve clip_length to HF max_position_embeddings if not set
     if clip_length is None:
         if getattr(model_config, "max_position_embeddings", None) is not None:
@@ -375,6 +401,11 @@ def run_inference(
         "compact_cpu_pages": compact_cpu_pages,
         "compact_async_transfers": compact_async_transfers,
         "compact_debug_checks": compact_debug_checks,
+        "compact_dynamic_admission": compact_dynamic_admission,
+        "max_num_batched_tokens": max_num_batched_tokens,
+        "compact_early_verify_length": compact_early_verify_length,
+        "compact_cpu_admit_fraction": compact_cpu_admit_fraction,
+        "compact_selected_capacity": compact_selected_capacity,
     }
 
     additional_args = {
@@ -383,6 +414,7 @@ def run_inference(
         "num_min_budget": num_min_budget,
         "num_sink_tokens": 4,
         "max_batch_size": max_batch_size,
+        "max_selected_kv_len": compact_selected_capacity if kv_cache == "compact" else 6 * 1024,
     }
     logger.info(f"eos_token_id: {job_args['eos_token_id']}")
 
@@ -437,12 +469,8 @@ def run_inference(
                 )
             if (
                 spec_stride + 1
-            ) * model_config.num_qo_heads // model_config.num_kv_heads >= 64:
-                logger.warning(
-                    f"Packed tokens in logits dump kernel is "
-                    f"{((spec_stride + 1) * model_config.num_qo_heads // model_config.num_kv_heads)}"
-                    f"which exceeds the limit of 64. This will impact the accuracy of speculation."
-                )
+            ) * model_config.num_qo_heads // model_config.num_kv_heads > 64:
+                logger.info("Use paged full-query selection scores above 64 packed QO rows")
             if (spec_stride + 1) >= RejectionSampler.MAX_SPEC_LEN:
                 # round up to the nearest multiple of 4
                 RejectionSampler.MAX_SPEC_LEN = math.ceil((spec_stride + 1) / 4) * 4
@@ -490,6 +518,7 @@ def run_inference(
                         max_batch_size=int(max_batch_size * 2.5),
                         num_cuda_graphs=14,
                         max_padded_ratio=1,  # Maximal double the batch size
+                        max_num_batched_tokens=max_num_batched_tokens,
                     )
 
             # record init elapsed (local variable; not exported globally)
@@ -731,10 +760,20 @@ if __name__ == "__main__":
                            help="Original GPU KV pool pages including native compact restore/repack peak")
     argparser.add_argument("--compact_cpu_pages", type=int, default=None,
                            help="Pinned CPU cold slots per TP rank, including old/new overlap")
+    argparser.add_argument("--compact_selected_capacity", type=int, default=6 * 1024,
+                           help="Per-request selection index slots; hot budget must be strictly smaller")
     argparser.add_argument("--compact_async_transfers", action="store_true",
                            help="On-demand compact KV transfers on a separate stream; combine with --async_cpu for CPU/GPU pipelining")
     argparser.add_argument("--compact_debug_checks", action="store_true",
                            help="Enable per-stage TP error exchange and ready-batch consistency diagnostics")
+    argparser.add_argument("--compact_dynamic_admission", action="store_true",
+                           help="Token-budgeted multi-prefill, preemption, CPU LRU and draft-preserving replay")
+    argparser.add_argument("--max_num_batched_tokens", type=int, default=None,
+                           help="Explicit profiled per-forward token limit for dynamic compact serving")
+    argparser.add_argument("--compact_early_verify_length", type=int, default=None,
+                           help="Optional draft-count trigger; otherwise terminate early only under KV pressure")
+    argparser.add_argument("--compact_cpu_admit_fraction", type=float, default=1.,
+                           help="Pause fresh prompts at this fraction of the CPU cold-page budget")
     argparser.add_argument("--temperature", type=float, default=0.0)
 
     argparser.add_argument("--perf_sim", action="store_true")
@@ -797,4 +836,9 @@ if __name__ == "__main__":
         compact_cpu_pages=args.compact_cpu_pages,
         compact_async_transfers=args.compact_async_transfers,
         compact_debug_checks=args.compact_debug_checks,
+        compact_dynamic_admission=args.compact_dynamic_admission,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        compact_early_verify_length=args.compact_early_verify_length,
+        compact_cpu_admit_fraction=args.compact_cpu_admit_fraction,
+        compact_selected_capacity=args.compact_selected_capacity,
     )

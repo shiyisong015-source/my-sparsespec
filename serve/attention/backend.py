@@ -12,9 +12,11 @@ from flashinfer.jit.core import JitSpec, gen_jit_spec, logger
 from flashinfer.jit.utils import filename_safe_dtype_map, write_if_different
 from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
 from flashinfer.utils import PosEncodingMode, TensorLayout, _unpack_paged_kv_cache
+from serve.attention.paged_scores import MAX_PACKED_SCORE_QO
 
 
 class BatchTopKAttention(BatchAttention):
+    MAX_PACKED_SCORE_QO = MAX_PACKED_SCORE_QO
     core_variant_name: str = "BatchTopKAttention"
     core_variant_decl: str = """
     struct BatchTopKAttention : AttentionVariantBase {
@@ -202,16 +204,18 @@ class BatchTopKAttention(BatchAttention):
         # dispatch to PersistentAttentionScorePersistent
         # choose both accurate and efficient `CTA_TILE_Q`
         _max_len_verify_packed_qo = num_qo_heads // num_kv_heads * self.MAX_SPEC_STRIDE
+        if _max_len_verify_packed_qo > self.MAX_PACKED_SCORE_QO:
+            raise ValueError(f"Selection scores support at most {self.MAX_PACKED_SCORE_QO} packed QO rows")
+        self.uses_paged_scores = _max_len_verify_packed_qo > 64
         if _max_len_verify_packed_qo <= 32:
             self.DISPATCH_CTA_TILE_Q = 32
         else:
             self.DISPATCH_CTA_TILE_Q = 64
 
-        if self.DISPATCH_CTA_TILE_Q < _max_len_verify_packed_qo:
+        if self.uses_paged_scores:
             logger.warning(
-                f"[LOGITS DUMP KERNEL]: CTA_TILE_Q={self.DISPATCH_CTA_TILE_Q} is not enough "
-                f"for max_len_verify_packed_qo={_max_len_verify_packed_qo}."
-                f"This potentially impact the accuracy of speculation."
+                f"Selection scores use the paged full-query path for "
+                f"{_max_len_verify_packed_qo} packed QO rows."
             )
 
         super().__init__(kv_layout, device, jit_args, jit_kwargs)
@@ -258,6 +262,8 @@ class BatchTopKAttention(BatchAttention):
         kv_indices: torch.Tensor,
         *args,
     ):
+        if self.uses_paged_scores:
+            raise RuntimeError("Long verification scores require paged_selection_scores and full request metadata")
         k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, self._kv_layout)
 
         head_dim_qk = q.shape[2]

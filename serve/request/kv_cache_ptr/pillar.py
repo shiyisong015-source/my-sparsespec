@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from serve.attention.backend import BatchTopKAttention, BatchTopKWrapper
+from serve.attention.paged_scores import prepare_paged_scores, paged_selection_scores
 from serve.model.model import KVPool
 from serve.request.kv_cache_ptr.base import FullCachePtr
 from serve.request.kv_cache_ptr.streaming import StreamingCachePtr
@@ -23,6 +24,7 @@ class PillarCachePtr(StreamingCachePtr):
     MAX_TOTAL_VERIFY_KV_LEN = 256 * 1024
     MAX_LEN_SELECTED_KV_CACHE = 6 * 1024
     MAX_SPEC_STRIDE = 16
+    MAX_PACKED_SCORE_QO = BatchTopKAttention.MAX_PACKED_SCORE_QO
     NUM_QO_HEADS = 1
     HEAD_DIM = 128
     DTYPE = torch.float16
@@ -38,6 +40,7 @@ class PillarCachePtr(StreamingCachePtr):
 
         # init metadata
         spec_cache_args = kwargs["spec_cache_args"]
+        cls.MAX_LEN_SELECTED_KV_CACHE = spec_cache_args.get("max_selected_kv_len", 6 * 1024)
         cls.NUM_QO_HEADS = kwargs["num_qo_heads"]
         cls.NUM_KV_HEADS = kwargs["num_kv_heads"]
         cls.NUM_LAYERS = kwargs["num_layers"]
@@ -175,6 +178,9 @@ class PillarCachePtr(StreamingCachePtr):
             dtype=torch.int32,
             device=device,
         )
+        if attn_core_wrapper.uses_paged_scores:
+            metadata["score_tile_indptr"] = torch.empty(
+                cls._MAX_BATCH_SIZE + 1, dtype=torch.int32, device=device)
 
         return [attn_core_wrapper, topk_wrapper], metadata
 
@@ -219,6 +225,8 @@ class PillarCachePtr(StreamingCachePtr):
         attn_fwd_metadata["flatten_indices"][..., :flatten_indices_len] = (
             flatten_indices[..., :flatten_indices_len]
         )
+        if wrappers[0].uses_paged_scores:
+            prepare_paged_scores(attn_fwd_metadata)
 
     @classmethod
     def dispatch_attn_fwd(
@@ -245,16 +253,20 @@ class PillarCachePtr(StreamingCachePtr):
         )
 
         # step 2. rematerialize scores
-        attn_core_wrapper.rematerialize_scores(
-            q,
-            out,
-            lse,
-            kv_pool._physical_mem_gpu[layer_idx],
-            attn_fwd_metadata["kv_indices"],
-            attn_fwd_metadata["request_type"],
-            attn_fwd_metadata["verify_kv_indptr"],
-            attn_fwd_metadata["dump_logits"][layer_idx],
-        )
+        if attn_core_wrapper.uses_paged_scores:
+            paged_selection_scores(q, kv_pool._physical_mem_gpu[layer_idx], lse,
+                                   attn_fwd_metadata, layer_idx, cls.MAX_SPEC_STRIDE)
+        else:
+            attn_core_wrapper.rematerialize_scores(
+                q,
+                out,
+                lse,
+                kv_pool._physical_mem_gpu[layer_idx],
+                attn_fwd_metadata["kv_indices"],
+                attn_fwd_metadata["request_type"],
+                attn_fwd_metadata["verify_kv_indptr"],
+                attn_fwd_metadata["dump_logits"][layer_idx],
+            )
 
         return out
 
@@ -359,11 +371,8 @@ class PillarCachePtr(StreamingCachePtr):
             if request.status == Request.ReqExecType.VERIFY:
                 if (
                     token_indptr_host[idx + 1] - token_indptr_host[idx]
-                ) * cls.NUM_QO_HEADS // cls.NUM_KV_HEADS > 64:
-                    # This warning is kernel implementation limit
-                    print(
-                        f"[Warning]: packed qo-len exceeds 64, which will be truncated"
-                    )
+                ) * cls.NUM_QO_HEADS // cls.NUM_KV_HEADS > cls.MAX_PACKED_SCORE_QO:
+                    raise ValueError("Verification exceeds selection score query capacity")
 
                 verify_kv_indptr_host.append(dump_logits_len)
                 dump_logits_len += request.len_loading_kv_cache
@@ -531,8 +540,9 @@ class PillarCachePtr(StreamingCachePtr):
             cls.MAX_LEN_SELECTED_KV_CACHE,
         )
 
-    @staticmethod
+    @classmethod
     def concat_selected_indices(
+        cls,
         input_metadata_host,
         input_metadata_device,
         requests,
@@ -591,7 +601,7 @@ class PillarCachePtr(StreamingCachePtr):
             len_selected_kv_indices
         )
         assert len_total_kv_indices < o_kv_indices_buf.shape[-1]
-        assert o_kv_indices_buf.shape[-1] == PillarCachePtr.MAX_TOTAL_DRAFT_KV_LEN
+        assert o_kv_indices_buf.shape[-1] == cls.MAX_TOTAL_DRAFT_KV_LEN
 
         # call kernel
         selected_kv_indices_ptrs = torch.from_numpy(selected_kv_indices_ptrs).to(
@@ -616,7 +626,7 @@ class PillarCachePtr(StreamingCachePtr):
         )
         StreamingCachePtr.concat_kv_indices_contiguous_kernel[grid](
             selected_kv_indices_ptrs,
-            PillarCachePtr.MAX_LEN_SELECTED_KV_CACHE,
+            cls.MAX_LEN_SELECTED_KV_CACHE,
             len_selected_kv_indices,
             all_kv_indices_tensor,
             all_kv_indices_offsets,

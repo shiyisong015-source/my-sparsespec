@@ -39,6 +39,13 @@ class Request:
         self.draft_probs = None
         self.len_draft_probs = 0  # 0-base
 
+        # Optional per-step plan used by the dynamic compact scheduler.
+        # None preserves the native scheduler's allocation behaviour.
+        self.scheduled_tokens = None
+        self.replay_target = None
+        self.replay_resume_status = None
+        self.rebuild_verify = False
+
     def attach_kv_pool(self, kv_pool: KVPool):
         """
         Init necessary metadata for this request.
@@ -80,7 +87,37 @@ class Request:
         """
         Check whether the request is fully prefilled.
         """
-        return self.len_token_ids > self.len_input
+        return self.replay_target is None and self.len_token_ids > self.len_input
+
+    @property
+    def replaying(self) -> bool:
+        return self.replay_target is not None
+
+    def begin_replay(self, computed_prefix: int):
+        """Freeze generation state; replay never edits the token/prob history.
+
+        The caller must first consume outstanding CPU-pipeline results and
+        defer release of the old KV until its GPU consumers have finished.
+        """
+        if self.replaying or self.status == self.ReqExecType.STALL:
+            raise RuntimeError("Replay requires a settled non-STALL request")
+        if any(token < 0 for token in self.token_ids):
+            raise RuntimeError("Consume asynchronous token placeholders before replay")
+        if self.status == self.ReqExecType.NORMAL:
+            target = computed_prefix
+            resume = self.ReqExecType.NORMAL
+        else:
+            # Last confirmed token is the first query of the verify window.
+            target = self.len_token_ids - self.len_draft_probs - 1
+            resume = self.ReqExecType.VERIFY if self.len_draft_probs else self.ReqExecType.DRAFT
+        if not 0 <= target < self.len_token_ids:
+            raise ValueError("Invalid replay prefix boundary")
+        self.replay_target, self.replay_resume_status = target, resume
+        self.status = self.ReqExecType.NORMAL
+        self.rebuild_verify = False
+        self.scheduled_tokens = None
+        for name in ("token_indptr", "prev_idx"):
+            self.__dict__.pop(name, None)
 
     @property
     def len_oracle_ctx(self):

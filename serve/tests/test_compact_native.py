@@ -1,6 +1,7 @@
 """Ownership/epoch tests on CPU, actual same-pool KV copies on CUDA."""
 
 import array
+from collections import OrderedDict
 import itertools
 import unittest
 from types import SimpleNamespace
@@ -309,6 +310,293 @@ class CPUGraphCapture(unittest.TestCase):
         self.assertIsNone(wrapper.captured_bsz)
         self.assertEqual((wrapper.num_total_tokens, wrapper.num_captured_tokens,
                           wrapper.num_padded_tokens), (7, 7, 1))
+
+
+class CPUDynamicAdmission(unittest.TestCase):
+    @staticmethod
+    def scheduler(capacity=128, budget=16):
+        base = CPUAsyncPipeline.scheduler()
+        from serve.scheduler.dynamic_compact_scheduler import DynamicCompactSpecScheduler
+        scheduler = DynamicCompactSpecScheduler.__new__(DynamicCompactSpecScheduler)
+        scheduler.__dict__.update(base.__dict__)
+        scheduler.kv_pool = Pool(capacity=capacity)
+        scheduler.token_budget, scheduler.early_verify_length = budget, None
+        scheduler.cpu_admit_limit = scheduler.cpu_capacity
+        scheduler._args.update(batch_policy="greedy", tp_ranks=2)
+        scheduler._cold_lru, scheduler._preempt_requested = {}, {}
+        scheduler._waiting_replays, scheduler._sample_rows = OrderedDict(), None
+        scheduler.metrics.update(scheduled_token_peak=0, prefill_request_peak=0,
+            prefill_query_tokens=0, replay_query_tokens=0, replay_starts=0,
+            replay_completions=0, preemptions=0, cpu_evictions=0, cpu_evicted_pages=0,
+            early_verifies=0, cpu_watermark_waits=0, token_budget_waits=0,
+            metadata_waits=0, kv_capacity_waits=0, pure_replay_forwards=0,
+            recovery_queue_peak=0, replay_admissions=0, recovery_memory_waits=0,
+            recovery_preemption_waits=0, recovery_idle_reclaims=0,
+            known_growth_reserve_peak=0)
+        return scheduler
+
+    def test_two_prefills_receive_an_exact_shared_token_plan(self):
+        scheduler = self.scheduler(budget=10)
+        scheduler._args["chunk_size"] = 8
+        pending = [Request([1] * 20, 16) for _ in range(3)]
+        for i, request in enumerate(pending):
+            request.request_id = i
+        scheduler.admit_requests(pending)
+        self.assertEqual([r.scheduled_tokens for r in scheduler.active_requests], [8, 2])
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(scheduler.metrics["prefill_request_peak"], 2)
+        self.assertEqual(scheduler.metrics["known_growth_reserve_peak"], 30)
+        for request in scheduler.active_requests:
+            request.retire()
+
+    def test_actual_cpu_occupancy_does_not_reserve_every_output_limit(self):
+        scheduler = self.scheduler(budget=40)
+        scheduler.max_batch_size = 40
+        scheduler.cpu_capacity = scheduler.cpu_admit_limit = 1
+        pending = [Request([1], 32767) for _ in range(40)]
+        for i, request in enumerate(pending):
+            request.request_id = i
+        scheduler.admit_requests(pending)
+        self.assertEqual(len(scheduler.active_requests), 40)
+        self.assertEqual(scheduler.metrics["max_live_requests"], 40)
+        for request in scheduler.active_requests:
+            request.retire()
+
+    def test_preemption_preserves_drafts_and_defers_old_page_release(self):
+        scheduler = self.scheduler()
+        request = Request([1, 2, 3], 10)
+        request.request_id = 0
+        request.attach_kv_pool(scheduler.kv_pool)
+        request.kv_cache_ptr.allocate_tokens(5)
+        request.token_ids.extend([4, 5, 6])
+        request.status = Request.ReqExecType.DRAFT
+        request.len_draft_probs = 2
+        probs = request.draft_probs
+        original_tokens = tuple(request.token_ids)
+        scheduler._requests[0] = request
+        scheduler._preempt_requested[0] = None
+        free = scheduler.kv_pool.num_free_pages
+        scheduler._apply_preemptions()
+        self.assertEqual(tuple(request.token_ids), original_tokens)
+        self.assertIs(request.draft_probs, probs)
+        self.assertEqual((request.len_draft_probs, request.replay_target), (2, 3))
+        self.assertEqual(scheduler._known_growth(request), 6)
+        self.assertEqual(scheduler.kv_pool.num_free_pages, free)
+        scheduler._retired[0].control_done = SimpleNamespace(query=lambda: True)
+        scheduler._poll_retired()
+        self.assertEqual(scheduler.kv_pool.num_free_pages, scheduler.kv_pool.capacity)
+        request.kv_cache_ptr.allocate_tokens(3)
+        scheduler._finish_replays()
+        self.assertEqual(request.status, Request.ReqExecType.VERIFY)
+        self.assertTrue(request.rebuild_verify)
+        self.assertIs(request.draft_probs, probs)
+        request.retire()
+
+    def test_replay_does_not_sample_or_advance_rng(self):
+        scheduler = self.scheduler()
+        scheduler._sample_rows = []
+        before = torch.random.get_rng_state().clone()
+        tokens, probs = scheduler._sample(torch.ones(4, 32), 4)
+        self.assertTrue(torch.equal(before, torch.random.get_rng_state()))
+        self.assertEqual(tuple(probs.shape), (4, 0))
+        self.assertEqual(tokens.tolist(), [0] * 4)
+
+    def test_waiting_replay_does_not_evict_older_prefill_when_space_is_tight(self):
+        scheduler = self.scheduler(capacity=20, budget=16)
+        older, younger = [Request([1] * 20, 16) for _ in range(2)]
+        for identity, request in enumerate((older, younger)):
+            request.request_id = identity
+            request.attach_kv_pool(scheduler.kv_pool)
+            request.kv_cache_ptr.allocate_tokens(12 if identity == 0 else 8)
+            request.initial_idx = request.cur_spec_idx = 0
+            scheduler._requests[identity] = request
+        scheduler._preempt_requested[1] = None
+        scheduler._apply_preemptions()
+        scheduler._retired[0].control_done = SimpleNamespace(query=lambda: True)
+        scheduler.admit_requests([])
+        self.assertEqual(scheduler.active_requests, [older])
+        self.assertIn(1, scheduler._waiting_replays)
+        self.assertEqual(scheduler._preempt_requested, {})
+        scheduler._requests.pop(0)
+        older.retire()
+        scheduler.admit_requests([])
+        self.assertEqual(scheduler.active_requests, [younger])
+        self.assertNotIn(1, scheduler._waiting_replays)
+        younger.retire()
+
+    def test_decode_and_multiple_replays_share_the_residual_budget(self):
+        scheduler = self.scheduler(capacity=64, budget=10)
+        scheduler._args["chunk_size"] = 4
+        decoding = CPUAsyncTransfers.request(scheduler.kv_pool, 0)
+        scheduler._requests[0] = decoding
+        replays = []
+        for identity in (1, 2):
+            request = Request([1] * 20, 16)
+            request.request_id = identity
+            request.attach_kv_pool(scheduler.kv_pool)
+            request.kv_cache_ptr.allocate_tokens(8)
+            request.initial_idx = request.cur_spec_idx = 0
+            scheduler._requests[identity] = request
+            scheduler._preempt_requested[identity] = None
+            replays.append(request)
+        scheduler._apply_preemptions()
+        for retired in scheduler._retired:
+            retired.control_done = SimpleNamespace(query=lambda: True)
+        scheduler.admit_requests([])
+        self.assertEqual(scheduler.active_requests, [decoding, *replays])
+        self.assertEqual([r.scheduled_tokens for r in scheduler.active_requests], [1, 4, 4])
+        self.assertEqual(scheduler._waiting_replays, {})
+        self.assertEqual(scheduler.metrics["replay_admissions"], 2)
+        # Admitted partial replays continue with running work next round.
+        for request in replays:
+            request.kv_cache_ptr.allocate_tokens(4)
+        decoding.kv_cache_ptr.allocate_tokens(1)
+        scheduler.admit_requests([])
+        self.assertEqual(scheduler.active_requests, [decoding, *replays])
+        self.assertEqual(scheduler.metrics["replay_admissions"], 2)
+        for request in scheduler.active_requests:
+            request.retire()
+
+    def test_round_that_preempts_running_work_does_not_admit_waiting_replay(self):
+        scheduler = self.scheduler(capacity=32, budget=16)
+        for identity, count in ((0, 18), (1, 14), (2, 0)):
+            request = Request([1] * 20, 16)
+            request.request_id = identity
+            request.attach_kv_pool(scheduler.kv_pool)
+            if count:
+                request.kv_cache_ptr.allocate_tokens(count)
+            request.initial_idx = request.cur_spec_idx = 0
+            scheduler._requests[identity] = request
+            if identity == 2:
+                request.begin_replay(8)
+                scheduler._waiting_replays[identity] = None
+        scheduler.admit_requests([])
+        self.assertEqual(set(scheduler._preempt_requested), {1})
+        self.assertIn(2, scheduler._waiting_replays)
+        self.assertEqual(scheduler.metrics["replay_admissions"], 0)
+        self.assertEqual(scheduler.metrics["recovery_preemption_waits"], 1)
+        for request in scheduler._requests.values():
+            request.retire()
+
+    def test_replay_admission_protects_known_prefix_not_only_its_first_chunk(self):
+        scheduler = self.scheduler(capacity=40, budget=8)
+        scheduler._args["chunk_size"] = 4
+        older = Request([1] * 30, 16)
+        older.request_id = 0
+        older.attach_kv_pool(scheduler.kv_pool)
+        older.kv_cache_ptr.allocate_tokens(20)
+        younger = Request([1] * 20, 16)
+        younger.request_id = 1
+        younger.attach_kv_pool(scheduler.kv_pool)
+        younger.begin_replay(12)
+        scheduler._requests = {0: older, 1: younger}
+        scheduler._waiting_replays[1] = None
+        scheduler.admit_requests([])
+        self.assertEqual(scheduler.active_requests, [older])
+        self.assertIn(1, scheduler._waiting_replays)
+        self.assertEqual(scheduler._preempt_requested, {})
+        older.retire()
+        younger.retire()
+
+    def test_running_younger_replay_cannot_preempt_an_older_request(self):
+        scheduler = self.scheduler(capacity=40, budget=4)
+        scheduler.cpu_capacity = 1  # No cold copy fits; only preemption can reclaim.
+        decoding = CPUAsyncTransfers.request(scheduler.kv_pool, 0)
+        older = CPUAsyncTransfers.request(scheduler.kv_pool, 1)
+        older.status = Request.ReqExecType.VERIFY
+        older.len_draft_probs = scheduler.spec_stride
+        younger = Request([1] * 20, 16)
+        younger.request_id = 2
+        younger.attach_kv_pool(scheduler.kv_pool)
+        younger.kv_cache_ptr.allocate_tokens(8)
+        younger.begin_replay(16)
+        scheduler._requests = {0: decoding, 1: older, 2: younger}
+        # Decode spends one token. The older Verify needs four and waits for
+        # next round; the younger replay must not evict it to use the last three.
+        scheduler.admit_requests([])
+        self.assertEqual(scheduler.active_requests, [decoding, younger])
+        self.assertEqual([r.scheduled_tokens for r in scheduler.active_requests], [1, 3])
+        self.assertEqual(scheduler._preempt_requested, {})
+        decoding.retire()
+        older.retire()
+        younger.retire()
+
+    def test_solo_resident_draft_can_use_real_free_page_below_workspace_reserve(self):
+        scheduler = self.scheduler(capacity=13, budget=16)
+        request = CPUAsyncTransfers.request(scheduler.kv_pool, 0, length=12)
+        scheduler._requests[0] = request
+        self.assertGreater(scheduler._runtime_reserve(), scheduler.kv_pool.num_free_pages)
+        scheduler.admit_requests([])
+        self.assertEqual(scheduler.active_requests, [request])
+        self.assertEqual(request.scheduled_tokens, 1)
+        request.retire()
+
+    def test_pressure_spill_is_selected_before_ready_batch_locks_its_candidates(self):
+        from serve.scheduler.async_compact_scheduler import TransferJob
+        scheduler = self.scheduler(capacity=44, budget=16)
+        requests = [CPUAsyncTransfers.request(scheduler.kv_pool, i, length=12) for i in range(3)]
+        scheduler._requests = {r.request_id: r for r in requests}
+
+        def submit(request, direction):
+            scheduler._transfers[request.request_id] = TransferJob(request, direction, None, 12, 7)
+
+        with patch.object(scheduler, "_submit_transfer", side_effect=submit) as spill:
+            scheduler.admit_requests([])
+        self.assertEqual(spill.call_args.args[1], "repack")
+        self.assertNotEqual(spill.call_args.args[0].request_id, 0)
+        self.assertNotIn(spill.call_args.args[0], scheduler.active_requests)
+        for request in requests:
+            request.retire()
+
+    def test_mixed_sampling_preserves_tp_rank_major_row_layout(self):
+        scheduler = self.scheduler()
+        scheduler._sample_rows = [1, 3]
+        shards = torch.arange(24).reshape(2, 4, 3)
+        expected = shards[:, [1, 3], :].contiguous().reshape(2, 6)
+        sampled = torch.tensor([2, 4], dtype=torch.int32)
+        distributions = torch.ones(2, 6)
+        module = "serve.scheduler.async_cpu_compact_scheduler.AsyncCPUCompactSpecScheduler._sample"
+        with patch(module, return_value=(sampled, distributions)) as sample:
+            tokens, probs = scheduler._sample(shards.reshape(4, 6), 4)
+        self.assertTrue(torch.equal(sample.call_args.args[0], expected))
+        self.assertEqual(tokens.tolist(), [0, 2, 0, 4])
+        self.assertEqual(probs.sum(dim=1).tolist(), [0, 6, 0, 6])
+
+    def test_evicted_cpu_copy_is_missing_not_an_empty_restore(self):
+        ptr = LocalPtr.__new__(LocalPtr)
+        ptr._closed, ptr._pending, ptr.phase = True, None, "hot"
+        ptr.cold_cpu = torch.empty(2, 7, 2, 1, 2, 128)
+        ptr.cold_missing = False
+        self.assertEqual(ptr.evict_cold(), 7)
+        self.assertTrue(ptr.cold_missing)
+        ptr.needs_pack = False
+        with self.assertRaisesRegex(RuntimeError, "requires replay"):
+            ptr.begin_restore()
+
+    def test_cpu_lru_skips_inflight_copy(self):
+        scheduler = self.scheduler()
+        scheduler.cpu_capacity = 25
+        for identity in (0, 1):
+            ptr = LocalPtr.__new__(LocalPtr)
+            ptr._closed, ptr._pending, ptr.phase = True, None, "hot"
+            ptr.cold_cpu, ptr.cold_missing = torch.empty(2, 10, 2, 1, 2, 128), False
+            scheduler._requests[identity] = SimpleNamespace(
+                request_id=identity, status=Request.ReqExecType.DRAFT, kv_cache_ptr=ptr)
+            scheduler._cold_lru[identity] = None
+        scheduler._transfers[0] = object()
+        self.assertTrue(scheduler._ensure_cpu_space(10))
+        self.assertEqual(scheduler._requests[0].kv_cache_ptr.cold_count, 10)
+        self.assertTrue(scheduler._requests[1].kv_cache_ptr.cold_missing)
+
+    def test_early_verify_uses_retained_draft_count(self):
+        scheduler = self.scheduler()
+        scheduler.spec_stride, scheduler.early_verify_length = 8, 4
+        request = Request([1], 16)
+        request.status, request.len_draft_probs = Request.ReqExecType.DRAFT, 4
+        scheduler._early_verify(request)
+        self.assertEqual(request.status, Request.ReqExecType.VERIFY)
+        self.assertEqual(scheduler.spec_stride + 1 - request.initial_idx, 5)
+        self.assertEqual(request.cur_spec_idx - request.initial_idx, request.len_draft_probs)
 
 
 class CPUCapacity(unittest.TestCase):

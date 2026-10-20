@@ -1,4 +1,7 @@
 # SparseSpec
+
+研究分支的跨服务器环境安装、当前代码、固定128条输入和实际拒绝随机数u采集入口见 [中文迁移运行说明](repro/README_zh.md)。
+
 > This repo is the proof-of-concept of our research project, which is not yet ready for production use.
 > We plan to upstream a subset of features to vLLM in the future.
 

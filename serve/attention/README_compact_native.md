@@ -1,5 +1,69 @@
 # 原生页池 compact KV
 
+## 动态准入、CPU LRU 与保留草稿的完整重放（2026-10-16）
+
+新入口选择 `DynamicCompactSpecScheduler`：
+
+```python
+kwargs = dict(
+    max_batch_size=128, mem_fraction=0.8, spec_stride=8,
+    kv_cache="compact", async_cpu=True, compact_async_transfers=True,
+    compact_dynamic_admission=True,
+    max_num_batched_tokens=512,
+    compact_early_verify_length=4,
+    compact_cpu_admit_fraction=1.0,
+)
+```
+
+CLI 同名参数：`--compact_dynamic_admission --max_num_batched_tokens 512
+--compact_early_verify_length 4 --compact_cpu_admit_fraction 1.0`，并启用
+`--compact_async_transfers --async_cpu`。token 预算必须显式设置且满足
+`k+1 <= budget < 32768`；512 是验证配置示例，需要结合实际模型、KV pool、
+请求上限和运行峰值选择。配置未开启动态入口时，继续使用既有调度路径。
+
+该路径支持：
+
+- 多个 chunked prefill，按每请求计划严格分配，所有阶段共享每轮 token 预算。
+- 用当前实际占用准入，不按所有请求最大输出长度预约 CPU；暂停请求的概率缓冲仍计入请求上限。
+- 提前 Verify：显式阈值按实际草稿数触发；阈值省略时，在 KV 压力下也可提前结束本轮 Draft。
+- 按当前 resident 热 KV 大小保留一次重排工作空间；空间不足时先尝试卸载，必要时请求抢占。
+- 请求粒度 CPU 冷 KV LRU，跳过在传输／结果处理中受保护的副本；缺失冷 KV 显式标记。
+- 保留草稿 token、原概率和输出预算的重放。先消费异步结果，再延迟释放旧 KV，
+  teacher forcing 重放前缀，然后验证整个保留草稿窗口。
+- 纯重放不采样；混合 batch 只采样非重放行，并保持 TP rank-major logits 布局。
+- 运行请求先分配预算，等待恢复／重放的请求使用剩余容量重新准入。
+  已开始的分块重放进入运行集合，可与其他重放、Draft、Verify 混合；
+  无需等待编号更早的请求完成整段生成。本轮发生抢占时不再准入等待请求。
+- 恢复准入保护已知输入／重放前缀和保留验证窗口的推进空间；
+  不预约未来最大输出长度。较晚的运行请求不能为自己的下一块抢占较早请求。
+  仅在没有可运行计算、传输或延迟释放可等待时，允许为队首恢复回收其他等待请求的 KV。
+- Graph 捕获桶不超过 token 预算；未捕获的形状使用已有 eager 路径。
+
+`compact_cpu_admit_fraction` 默认 1.0，表示 CPU 有效 backing 达到容量时停止新
+prefill；可以显式配置更低比例。首版使用单水位，没有实现高／低双水位迟滞。
+仍按 GPU 页、原生索引容量和 query 容量组 batch。启动时检查单请求总长度上限
+加 speculative 尾部能独占放入 pool；这不是多请求的总长度预约。
+
+普通路径按需分配临时张量，新增 `runtime_peak_allocated_bytes`、
+`runtime_peak_reserved_bytes` 记录运行峰值。该版本没有自动寻找全局 token 预算，
+也没有实现按已采样行跳过 LM head：纯重放仍经过模型词表投影，但不生成概率／随机采样工作区。
+`compact_debug_checks=True` 时额外逐次检查重放没有修改原草稿概率和 token。
+
+详细设计见 [准入与重放设计](../../research/admission_offload_replay_design_2026-10-16_zh.md)，
+本轮验证产物见 `log/dynamic-compact-20261016/`。
+
+恢复准入修正（2026-10-16）：首版的全局队首门禁在小 pool 下造成重放后逐请求
+生成，完整对照与退化诊断保存在 `log/dynamic-compact-perf-20261016/`。
+本次修复的验证／复测写入 `log/dynamic-compact-recovery-20261016/`；
+以其中状态与报告区分 CPU 检查、GPU 预检和完整性能结果。
+
+2026-10-17 验证已完成：60 项单测、TP2 小池／20K 边界检查及三组各 128 条 LCB
+均通过。相对上一 compact 提交 `fca9953`，大 GPU pool 下 CPU 配额 40000／1016087
+页时吞吐分别为 2.506×／1.056×；GPU pool 65536 页时为 1.970×。
+压力组实际 batch 平均 27.32、峰值 110，324 次卸载／恢复，无完整重放。
+测试固定 k8/r.05、输出上限 2048，每配置一次；两个大 pool 组未实际卸载，
+CPU 小配额组收益来自准入方式调整。完整配置、限制与数据见该目录报告。
+
 实现日期：2026-10-14；基线提交 `aaffc0fa4bb92836fd042ababa1dfcf809e7b208`。本版作为异步与准入策略改进前的本地提交检查点。`kv_cache="compact"` 是本文入口；`kv_cache="packed"` 保留 aaffc0f 的 Triton 原型。
 
 ## 使用
@@ -180,7 +244,7 @@ QKV/MLP/RoPE、原 attention/score/TopK 数学和输出采样/rejection 继续�
 
 ## 限制与预算
 
-- `k>=1`、`0<r<=1`、`min_budget>=k+2`，最大热预算严格 `<6144`；`GQA*(k+1)<=64`。原 public `run_inference` 按需上调 `RejectionSampler.MAX_SPEC_LEN`；其默认 10 不是公共入口的固定 k 上限。直接构造 scheduler 的测试/调用者需先完成原 metadata 和概率缓冲初始化。
+- `k>=1`、`0<r<=1`、`min_budget>=k+2`，最大热预算严格 `<6144`。2026-10-19 扩展：`GQA*(k+1)<=64` 仍使用原score kernel；更长窗口使用`paged_scores.py`完整计算所有query的选择分数，当前容量为256个打包query行。Qwen3-8B的k32对应132行。attention前向仍使用原生FlashInfer；新路径增加每phase一张score tile前缀表，规划在Graph外完成、score计算在Graph内重放。原 public `run_inference` 按需上调 `RejectionSampler.MAX_SPEC_LEN`（k32为36）；默认10不是公共入口的固定k上限。直接构造scheduler需先完成metadata和概率缓冲初始化。
 - batch draft 总索引 `<128*1024`，verify `<256*1024`，query NNZ `<32768`，batch `<4096`。冷启动 draft 包含整个 prompt，不能只按热比例估算。超预算请求等待；单请求无法满足保守峰值时明确失败。
 - 初次迁移至少 old full + new hot；后续包括同批 append、全部恢复 cold、串行迁移中的最大 replacement hot。CPU live 预算包含 old/new cold 重叠。源码固定 k/r，不支持层间 overlap；CPU 流水与模型 forward CUDA Graph 使用上述显式开关。
 - 只保留一个生产 GPU KV pool；关闭未使用的 legacy 1.5× CPU full buffer。`free_page` 增加池内可用页，**不降低已经预分配的 CUDA tensor/reserved 显存**。降低物理显存需要显式减小 `compact_pool_pages` 并验证峰值。

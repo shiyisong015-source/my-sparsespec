@@ -1,0 +1,234 @@
+{
+  "protocol": {
+    "k": 63,
+    "request_folds": 5,
+    "folds": "original request_id %5",
+    "minimum_previous_normal_rounds": 8,
+    "quantiles": [
+      0.8,
+      0.9,
+      0.95
+    ],
+    "fixed_L2": 0.01,
+    "training_sample_cap_per_request": 128,
+    "feature_names": [
+      "log_context",
+      "effective_retention",
+      "log_generated",
+      "previous_accepted",
+      "mean8_accepted",
+      "std8_accepted",
+      "mean32_accepted",
+      "past4_conditional_mean",
+      "past4_survival16",
+      "past4_survival32",
+      "past4_survival48",
+      "dropped_mass_mean",
+      "dropped_mass_p90",
+      "dropped_mass_max",
+      "dropped_mass_sd",
+      "retention_fraction_mean",
+      "retention_fraction_p10",
+      "retention_fraction_sd",
+      "old_mass_mean",
+      "old_concentration",
+      "dropped_mass_change_mean",
+      "dropped_mass_change_p90",
+      "worst_layer_mean_dropped",
+      "source_accept_fraction",
+      "first_q_entropy",
+      "first_q_max",
+      "first_q_sample_logprob"
+    ],
+    "prediction_times": "state_history_selection before draft; firstdraft model after exactly one draft token",
+    "target": "Censored actual accepted draft tokens A63; current p/alpha and future q are excluded from current features",
+    "primary": "Coverage, upper length, shortfall, excess and pinball together; cap=63 remains censored; offline results do not prove adaptive-k throughput"
+  },
+  "scored_rounds": 50616,
+  "requests": 128,
+  "results": {
+    "constant": {
+      "0.8": {
+        "request_equal": {
+          "coverage": 0.80350932903081,
+          "mean_upper": 53.3984375,
+          "shortfall": 1.6762727963855695,
+          "excess": 27.025798832973372,
+          "pinball": 6.746178003703129,
+          "at_cap": 0.0
+        }
+      },
+      "0.9": {
+        "request_equal": {
+          "coverage": 1.0,
+          "mean_upper": 63.0,
+          "shortfall": 0.0,
+          "excess": 34.951088536587804,
+          "pinball": 3.4951088536587793,
+          "at_cap": 1.0
+        }
+      },
+      "0.95": {
+        "request_equal": {
+          "coverage": 1.0,
+          "mean_upper": 63.0,
+          "shortfall": 0.0,
+          "excess": 34.951088536587804,
+          "pinball": 1.7475544268293919,
+          "at_cap": 1.0
+        }
+      }
+    },
+    "history64": {
+      "0.8": {
+        "request_equal": {
+          "coverage": 0.8216650148167439,
+          "mean_upper": 47.84854205267639,
+          "shortfall": 2.380170510825546,
+          "excess": 22.17980110008974,
+          "pinball": 6.340096628678383,
+          "at_cap": 0.20475386795461115
+        }
+      },
+      "0.9": {
+        "request_equal": {
+          "coverage": 0.9379747344284401,
+          "mean_upper": 57.56556785923699,
+          "shortfall": 0.5941536251790795,
+          "excess": 30.11081002100388,
+          "pinball": 3.545819264761559,
+          "at_cap": 0.5597691620857943
+        }
+      },
+      "0.95": {
+        "request_equal": {
+          "coverage": 0.980067267716515,
+          "mean_upper": 61.15408468340101,
+          "shortfall": 0.1499573577119815,
+          "excess": 33.2551305777008,
+          "pinball": 1.8052160187114232,
+          "at_cap": 0.7992601789044684
+        }
+      }
+    },
+    "state_history": {
+      "0.8": {
+        "request_equal": {
+          "coverage": 0.8530009653108963,
+          "mean_upper": 49.373937065003005,
+          "shortfall": 1.7697426292577902,
+          "excess": 23.0947682308486,
+          "pinball": 6.034747749575951,
+          "at_cap": 0.25320022979165296
+        }
+      },
+      "0.9": {
+        "request_equal": {
+          "coverage": 0.9621871623671328,
+          "mean_upper": 59.253703202458304,
+          "shortfall": 0.29593173407916007,
+          "excess": 31.50072347312527,
+          "pinball": 3.4164109079837703,
+          "at_cap": 0.6237309856819653
+        }
+      },
+      "0.95": {
+        "request_equal": {
+          "coverage": 0.9946127755347676,
+          "mean_upper": 62.5930460200967,
+          "shortfall": 0.0233002293228724,
+          "excess": 34.567434786007375,
+          "pinball": 1.750506957157099,
+          "at_cap": 0.9149262152857378
+        }
+      }
+    },
+    "state_history_selection": {
+      "0.8": {
+        "request_equal": {
+          "coverage": 0.8642309803881677,
+          "mean_upper": 48.88350397915961,
+          "shortfall": 1.6542412527898966,
+          "excess": 22.488833768537315,
+          "pinball": 5.82115975593938,
+          "at_cap": 0.28352128826010725
+        }
+      },
+      "0.9": {
+        "request_equal": {
+          "coverage": 0.9600570298911835,
+          "mean_upper": 57.66653142500995,
+          "shortfall": 0.3812329061029901,
+          "excess": 29.99885286770075,
+          "pinball": 3.342994902262766,
+          "at_cap": 0.6064888526601204
+        }
+      },
+      "0.95": {
+        "request_equal": {
+          "coverage": 0.9885266123702015,
+          "mean_upper": 61.252046832908164,
+          "shortfall": 0.08050971783028364,
+          "excess": 33.28364508732625,
+          "pinball": 1.7406664863050834,
+          "at_cap": 0.8248119341019218
+        }
+      }
+    },
+    "state_history_selection_firstdraft": {
+      "0.8": {
+        "request_equal": {
+          "coverage": 0.8645422564668458,
+          "mean_upper": 48.774395459480175,
+          "shortfall": 1.6712393223390194,
+          "excess": 22.396723318407,
+          "pinball": 5.816336121552615,
+          "at_cap": 0.2837681854476475
+        }
+      },
+      "0.9": {
+        "request_equal": {
+          "coverage": 0.9596674608589866,
+          "mean_upper": 57.55286377751404,
+          "shortfall": 0.391034252048179,
+          "excess": 29.89498656615002,
+          "pinball": 3.3414294834583624,
+          "at_cap": 0.6061701581850356
+        }
+      },
+      "0.95": {
+        "request_equal": {
+          "coverage": 0.9885324726081592,
+          "mean_upper": 61.17677749452656,
+          "shortfall": 0.08437006981239595,
+          "excess": 33.21223610092676,
+          "pinball": 1.7407633713681154,
+          "at_cap": 0.8248196407139223
+        }
+      }
+    }
+  },
+  "comparisons": {
+    "0.8": {
+      "selection_pinball_improvement": 0.21358799363657166,
+      "request_bootstrap95": [
+        0.17605806940228996,
+        0.24890536196786162
+      ]
+    },
+    "0.9": {
+      "selection_pinball_improvement": 0.07341600572100457,
+      "request_bootstrap95": [
+        0.0530729984298575,
+        0.09467890920964311
+      ]
+    },
+    "0.95": {
+      "selection_pinball_improvement": 0.009840470852015743,
+      "request_bootstrap95": [
+        -0.0014982729021728854,
+        0.020723887680528144
+      ]
+    }
+  }
+}

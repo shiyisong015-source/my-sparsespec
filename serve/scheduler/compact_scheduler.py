@@ -52,9 +52,10 @@ class CompactSpecScheduler(SpecScheduler):
         k, ratio, minimum = kwargs["spec_stride"], kwargs["budget_ratio"], kwargs["num_min_budget"]
         if (k < 1 or not math.isfinite(ratio) or not 0 < ratio <= 1
                 or not k + 2 <= minimum < CompactCachePtr.MAX_LEN_SELECTED_KV_CACHE):
-            raise ValueError("Require k>=1, 0<ratio<=1, and k+2<=min_budget<6144")
-        if (k + 1) * kv_pool.num_qo_heads // kv_pool.num_kv_heads > 64:
-            raise ValueError("Native score kernel supports at most 64 packed QO rows")
+            raise ValueError("Require k>=1, 0<ratio<=1, and k+2<=min_budget<selected capacity")
+        if ((k + 1) * kv_pool.num_qo_heads // kv_pool.num_kv_heads
+                > CompactCachePtr.MAX_PACKED_SCORE_QO):
+            raise ValueError("Verification exceeds selection score query capacity")
         super().__init__(kv_pool, model, **kwargs)
         self.group = kwargs.get("compact_control_group")
         self.rank = dist.get_rank() if self.group is not None else 0
@@ -303,8 +304,9 @@ class CompactSpecScheduler(SpecScheduler):
             if limit is None or request.len_output < 1 or request.len_input < 1:
                 raise ValueError("Compact requests require a nonempty prompt and positive finite output limit")
             if max(self.spec_cache_args["num_min_budget"], math.ceil(
-                    (limit + self.spec_stride + 1) * self.spec_cache_args["budget_ratio"])) >= 6144:
-                raise ValueError("Request's maximum hot budget must be strictly below 6144")
+                    (limit + self.spec_stride + 1) * self.spec_cache_args["budget_ratio"])) >= CompactCachePtr.MAX_LEN_SELECTED_KV_CACHE:
+                raise ValueError("Request's maximum hot budget must be strictly below "
+                                 f"{CompactCachePtr.MAX_LEN_SELECTED_KV_CACHE}")
         completed = []
         start = time.perf_counter()
         self._run_start_perf_counter = start

@@ -55,6 +55,7 @@ class CUDAGraphModelWrapper:
         max_batch_size: int = 256,
         num_cuda_graphs: int = 16,
         max_padded_ratio: float = 0.1,
+        max_num_batched_tokens: int = None,
     ):
         """
         Capture as many CUDA graphs as possible for the given max batch size.
@@ -101,6 +102,8 @@ class CUDAGraphModelWrapper:
             return x_int_no_dup
 
         captured_args = [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 640]
+        if max_num_batched_tokens is not None:
+            captured_args = [size for size in captured_args if size <= max_num_batched_tokens]
         self.capture(captured_args)
 
     @torch.inference_mode()

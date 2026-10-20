@@ -64,6 +64,7 @@ class CompactCachePtr(PillarCachePtr):
         self.restored_pages = ()
         self.tail_pages = []
         self.cold_cpu = None
+        self.cold_missing = False
         self.recent_count = 0
         self.epoch = 0
         self.verify_epoch = None
@@ -85,6 +86,21 @@ class CompactCachePtr(PillarCachePtr):
     @property
     def owned_pages(self):
         return frozenset(self._owned)
+
+    def evict_cold(self):
+        """Drop an idle CPU cache copy without changing the draft view."""
+        if self._pending is not None:
+            raise RuntimeError("Cannot evict a CPU buffer used by a KV transaction")
+        count = self.cold_count
+        if count:
+            self.cold_cpu = None
+            self.cold_missing = self.phase == "hot"
+        return count
+
+    def mark_replayed_verify_tail(self, count):
+        if self.phase != "full" or not 1 <= count <= len(self.indices):
+            raise RuntimeError("Invalid rebuilt verification window")
+        self.tail_pages = list(self.indices[-count:])
 
     @classmethod
     def from_kv_cache(cls, source_cache, **config):
@@ -148,7 +164,8 @@ class CompactCachePtr(PillarCachePtr):
         budget = max(config.get("num_min_budget", 128),
                      math.ceil(self.len_kv_cache * config.get("budget_ratio", .05)))
         if budget >= self.MAX_LEN_SELECTED_KV_CACHE or min(budget, self.len_kv_cache) < recent:
-            raise ValueError("Hot budget must cover the forced recent suffix and be <6144")
+            raise ValueError("Hot budget must cover the forced recent suffix and be "
+                             f"<{self.MAX_LEN_SELECTED_KV_CACHE}")
         result = super().get_select_metadata(**config)
         self.recent_count = recent
         self.needs_pack = True
@@ -168,6 +185,7 @@ class CompactCachePtr(PillarCachePtr):
         self.phase, self.needs_pack = "resident", False
         self.hot_pages, self.restored_pages, self.tail_pages = (), (), []
         self.cold_cpu = None
+        self.cold_missing = False
         self.verify_epoch = None
 
     def prepare_resident_offload(self):
@@ -192,6 +210,8 @@ class CompactCachePtr(PillarCachePtr):
     def begin_restore(self):
         if self.phase != "hot" or self._pending is not None or self.needs_pack:
             raise RuntimeError("Restore requires a committed hot cache")
+        if self.cold_missing:
+            raise RuntimeError("Evicted cold KV requires replay, not an empty restore")
         pages = self._allocate(self.cold_count)
         try:
             if self.cold_count:
@@ -259,6 +279,7 @@ class CompactCachePtr(PillarCachePtr):
         tail_count = transfer.tail_count
         self.hot_pages = transfer.pages[:-tail_count] if tail_count else transfer.pages
         self.cold_cpu = transfer.cold
+        self.cold_missing = False
         self.indices = array.array("i", transfer.pages)
         self.restored_pages = ()
         self.tail_pages = list(transfer.pages[-tail_count:]) if tail_count else []
@@ -311,7 +332,7 @@ class CompactCachePtr(PillarCachePtr):
         for i, request in enumerate(requests):
             if request.status == Request.ReqExecType.VERIFY:
                 if ((host["token_indptr"][i + 1] - host["token_indptr"][i])
-                        * cls.NUM_QO_HEADS // cls.NUM_KV_HEADS > 64):
-                    raise ValueError("Native score kernel supports at most 64 packed QO rows")
+                        * cls.NUM_QO_HEADS // cls.NUM_KV_HEADS > cls.MAX_PACKED_SCORE_QO):
+                    raise ValueError("Verification exceeds selection score query capacity")
                 request.kv_cache_ptr.freeze_verify_view()
         super().dispatch_prepare_fwd_metadata(**kwargs)

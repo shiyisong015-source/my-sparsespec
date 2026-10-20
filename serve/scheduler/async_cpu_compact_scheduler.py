@@ -15,6 +15,7 @@ import time
 import torch
 import torch.distributed as dist
 
+from serve.request.kv_cache_ptr.compact import CompactCachePtr
 from serve.request.request import Request
 from serve.scheduler.async_compact_scheduler import AsyncCompactSpecScheduler
 from serve.scheduler.compact_scheduler import coordinated
@@ -183,8 +184,9 @@ class AsyncCPUCompactSpecScheduler(AsyncCompactSpecScheduler):
             if limit is None or request.len_output < 1 or request.len_input < 1:
                 raise ValueError("Compact requests require nonempty prompts and finite positive output limits")
             if max(self.spec_cache_args["num_min_budget"], math.ceil(
-                    (limit + self.spec_stride + 1) * self.spec_cache_args["budget_ratio"])) >= 6144:
-                raise ValueError("Request's maximum hot budget must be below 6144")
+                    (limit + self.spec_stride + 1) * self.spec_cache_args["budget_ratio"])) >= CompactCachePtr.MAX_LEN_SELECTED_KV_CACHE:
+                raise ValueError("Request's maximum hot budget must be below "
+                                 f"{CompactCachePtr.MAX_LEN_SELECTED_KV_CACHE}")
             if "retire" in request.__dict__:
                 raise ValueError("CPU pipeline cannot replace an existing per-request retirement hook")
         completed, previous = [], None
@@ -198,6 +200,13 @@ class AsyncCPUCompactSpecScheduler(AsyncCompactSpecScheduler):
                 self.step_id += 1
                 self._run_stage("CPU pipeline admission", lambda: self.admit_requests(pending_requests))
                 if not self.active_requests:
+                    if getattr(self, "has_pending_preemption", lambda: False)():
+                        # Settle the previous rows before detaching a victim's
+                        # KV. Its draft probability buffer remains alive.
+                        newly_completed, _ = self._consume_previous(previous, None, None, None)
+                        completed.extend(newly_completed)
+                        previous = None
+                        continue
                     self.wait_for_ready_requests()
                     continue
                 computing = [r for r in self.active_requests if r.status != Request.ReqExecType.STALL]

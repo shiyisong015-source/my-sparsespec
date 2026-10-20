@@ -1,0 +1,7 @@
+{
+  "exported_at": "2026-10-20T14:28:13.253713+08:00",
+  "k63_summary_snapshot": "r=.05/.10/.25; statistics copied before the remaining cases completed; not a live status report",
+  "smoke_evidence_archive_sha256": "daed4d4efff87f89187713f9271317bd9a1d275404dc9186867656c3113a4583",
+  "smoke_uses_actual_uniforms": true,
+  "formal_k63_prior_scan_recorded_uniforms": false
+}
