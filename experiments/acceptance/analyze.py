@@ -8,7 +8,7 @@ from pathlib import Path
 
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parent / ".matplotlib"))
+os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parents[2] / ".repro/matplotlib"))
 import numpy as np
 
 K = 63

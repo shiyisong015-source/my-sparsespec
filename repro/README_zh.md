@@ -100,7 +100,7 @@ python -u -m experiments.acceptance.run --model /data/models/Qwen3-8B \
 | 数据 | `experiments/acceptance/inputs/lcb128-seed330.jsonl`，同一128条请求、顺序、prompt 和 input IDs |
 | 输出 | 自然 EOS；每请求上限 `32768 - input_tokens` |
 | batch 上限 | 128；实际 batch 随资源和阶段变化 |
-| k | 63；支持指定1到63，分析绘图脚本仅针对k63 |
+| k | 63；允许指定4到63，其他k先短测；分析绘图脚本仅针对k63 |
 | r | .05/.10/.15/.20/.25 |
 | chunk / 最小 KV 预算 | 256 / 192 |
 | GPU 内存比例 | 0.8，可用 `--mem-fraction` 显式调整并记录 |

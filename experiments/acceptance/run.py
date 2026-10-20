@@ -62,8 +62,8 @@ def prepare(args):
         raise ValueError("Use distinct r values in (0,.25]")
     if len({f"{r:.2f}" for r in args.ratios}) != len(args.ratios):
         raise ValueError("Ratios must have distinct two-decimal directory names")
-    if not 1 <= args.requests <= 128 or not 1 <= args.batch_size <= 128 or not 1 <= args.k <= 63:
-        raise ValueError("Require requests/batch in [1,128] and k in [1,63]")
+    if not 1 <= args.requests <= 128 or not 1 <= args.batch_size <= 128 or not 4 <= args.k <= 63:
+        raise ValueError("Require requests/batch in [1,128] and k in [4,63]")
     if not 0 < args.mem_fraction < 1 or (args.max_output_tokens is not None and args.max_output_tokens < 1):
         raise ValueError("Invalid memory fraction/output limit")
     model = args.model.resolve()

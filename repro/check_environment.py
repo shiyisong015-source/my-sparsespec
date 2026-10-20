@@ -1,5 +1,6 @@
 """Check dependencies and native library loading; GPU allocation is opt-in."""
 import argparse
+import contextlib
 import ctypes
 import importlib.metadata
 import json
@@ -35,8 +36,9 @@ def main():
             raise SystemExit(f"Missing native dependency: {prefix / name}")
     ctypes.CDLL(str(prefix / "lib/librapids_logger.so"), mode=ctypes.RTLD_GLOBAL)
     ctypes.CDLL(str(prefix / "lib/librmm.so"), mode=ctypes.RTLD_GLOBAL)
-    from vllm import _custom_ops
-    from serve.attention.backend import BatchTopKWrapper
+    with contextlib.redirect_stdout(sys.stderr):
+        from vllm import _custom_ops
+        from serve.attention.backend import BatchTopKWrapper
     toolkit = subprocess.check_output([str(Path(os.environ["CUDA_HOME"]) / "bin/nvcc"),
                                        "--version"], text=True)
     if "release 12.8" not in toolkit:
