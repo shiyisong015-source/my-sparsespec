@@ -29,6 +29,106 @@ class PolicyTests(unittest.TestCase):
             scheduler.metrics["reservation_" + key] = 0
         return scheduler
 
+    def test_same_slot_repacks_queue_and_commit_independently(self):
+        scheduler = self.scheduler()
+        scheduler.reservation_transfer_queue = True
+        requests = [fixtures.CPUAsyncTransfers.request(scheduler.kv_pool, i) for i in range(2)]
+        scheduler._requests = {r.request_id: r for r in requests}
+        scheduler._plan_repacks()
+        table = scheduler.reservation_table
+        self.assertEqual(table.reservations[-1].start, table.reservations[-2].start)
+        scheduler.step_id = table.reservations[-1].start
+        table.advance(scheduler.step_id)
+        ready = {0: False, 1: False}
+
+        def submit(request, direction):
+            ptr = request.kv_cache_ptr
+            ptr.prepare_resident_offload()
+            event = SimpleNamespace(query=lambda: ready[request.request_id], synchronize=lambda: None)
+            transfer = PageTransfer(ptr._allocate(5), event, cold=torch.empty(2, 7, 2, 1, 2, 128))
+            ptr._pending = transfer
+            scheduler._transfers[request.request_id] = SimpleNamespace(
+                direction=direction, request=request, transfer=transfer, source_pages=12, cold_pages=7)
+
+        with patch.object(scheduler, "_submit_transfer", side_effect=submit) as mocked:
+            scheduler._start_repack()
+            self.assertEqual(mocked.call_count, 2)
+            scheduler._start_repack()
+            self.assertEqual(mocked.call_count, 2)  # No duplicate submission.
+        scheduler.step_id += 1
+        table.advance(scheduler.step_id)
+        scheduler._reconcile_reservations()
+        self.assertTrue(all(r.materialized for r in table.reservations.values()))
+        self.assertEqual(scheduler.metrics["reservation_replans"], 0)
+        scheduler._poll_transfers()
+        self.assertEqual(len(scheduler._transfers), 2)
+        # Exercise event queries independently, irrespective of request-ID order.
+        ready[1] = True
+        scheduler._poll_transfers()
+        self.assertEqual(set(scheduler._transfers), {0})
+        self.assertEqual(requests[0].kv_cache_ptr.phase, "resident")
+        ready[0] = True
+        scheduler._poll_transfers()
+        self.assertFalse(scheduler._transfers)
+        self.assertEqual(scheduler.metrics["reservation_release_commits"], 2)
+        for request in requests:
+            request.kv_cache_ptr.close()
+            request.retire()
+        self.assertEqual(scheduler.kv_pool.num_free_pages, scheduler.kv_pool.capacity)
+
+    def test_same_slot_restores_allocate_targets_before_queueing(self):
+        scheduler = self.scheduler()
+        scheduler.reservation_transfer_queue = True
+        requests = [fixtures.CPUAsyncTransfers.request(scheduler.kv_pool, i) for i in range(2)]
+        scheduler._requests = {r.request_id: r for r in requests}
+        table = scheduler.reservation_table
+        for request in requests:
+            ptr = request.kv_cache_ptr
+            original = tuple(ptr.indices)
+            ptr._release(original[5:])
+            ptr.indices = type(ptr.indices)("i", original[:5])
+            ptr.hot_pages, ptr.tail_pages = original[:5], []
+            ptr.phase, ptr.recent_count = "hot", 2
+            ptr.cold_cpu = torch.empty(2, 7, 2, 1, 2, 128)
+            table.reserve(request.request_id, transfer_bytes=7, memory_pages=7,
+                          anchor=1, resident_pages=10, capacity_pages=256)
+        scheduler.step_id = table.reservations[0].start
+        table.advance(scheduler.step_id)
+        free_before = scheduler.kv_pool.num_free_pages
+
+        def submit(request, direction):
+            ptr = request.kv_cache_ptr
+            event = SimpleNamespace(query=lambda: True, synchronize=lambda: None)
+            transfer = PageTransfer(ptr._allocate(7), event, keepalive=ptr.cold_cpu)
+            ptr._pending = transfer
+            scheduler._transfers[request.request_id] = SimpleNamespace(
+                direction=direction, request=request, transfer=transfer, source_pages=5, cold_pages=7)
+
+        with patch.object(scheduler, "_submit_transfer", side_effect=submit) as mocked:
+            scheduler._start_reload()
+            self.assertEqual(mocked.call_count, 2)
+        self.assertEqual(scheduler.kv_pool.num_free_pages, free_before - 14)
+        self.assertEqual(len(scheduler._transfers), 2)
+        # The base submit contract rejects duplicate jobs before touching CUDA.
+        with self.assertRaisesRegex(RuntimeError, "already has"):
+            scheduler._submit_transfer(requests[0], "restore")
+        scheduler._poll_transfers()
+        for request in requests:
+            self.assertEqual(request.kv_cache_ptr.phase, "verify")
+            self.assertEqual(set(request.kv_cache_ptr.indices), request.kv_cache_ptr.owned_pages)
+            request.kv_cache_ptr.close()
+            request.retire()
+        self.assertEqual(scheduler.kv_pool.num_free_pages, scheduler.kv_pool.capacity)
+
+    def test_legacy_executor_still_limits_submission(self):
+        scheduler = self.scheduler()
+        scheduler.reservation_transfer_queue = False
+        scheduler._transfers[99] = SimpleNamespace(direction="restore")
+        with patch.object(scheduler, "_submit_transfer") as submit:
+            scheduler._start_reload()
+            scheduler._start_repack()
+            submit.assert_not_called()
+
     def test_due_verify_preserves_native_window_math(self):
         scheduler = self.scheduler()
         request = Request([1], 32)

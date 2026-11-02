@@ -4,7 +4,10 @@ The calendar predicts future reload/verify windows; real page availability,
 query/metadata bounds and TP-wide CUDA completion still gate execution.
 Unlike the on-demand policy, every selected resident cold cache is repacked
 before its next sparse cycle. CPU eviction/replay and pressure early-verify
-are deliberately not part of this baseline.
+are deliberately not part of this baseline. Ready transfers are queued on one
+CUDA stream per rank so same-slot bookings progress during model submission.
+The configured iteration duration remains the approximate forward-cycle clock;
+only observed TP-wide events authorize layout publication and page release.
 """
 import json
 import math
@@ -34,6 +37,7 @@ class ReservationCompactSpecScheduler(DynamicCompactSpecScheduler):
         # Validate before constructing any CUDA objects.
         table = ReservationTable(horizon, bandwidth * 1e9, iteration_ms / 1000.)
         super().__init__(kv_pool, model, **kwargs)
+        self.reservation_transfer_queue = kwargs.get("reservation_transfer_queue", True)
         self.reservation_table, self.reservation_target = table, target
         self._reservation_wait_since = {}
         self._reservation_selection = {}
@@ -297,14 +301,15 @@ class ReservationCompactSpecScheduler(DynamicCompactSpecScheduler):
                                     release_event=event.event_id, release_at=event.available_at)
 
     def _start_repack(self):
-        if self._transfers:
+        if self._transfers and not getattr(self, "reservation_transfer_queue", True):
             return
         # Also supports direct callers; planning itself needs no free link.
         self._plan_repacks()
         bookings = sorted((r for r in self.reservation_table.reservations.values()
                            if r.request_id < 0), key=lambda r: (r.start, r.deadline, r.request_id))
         for reservation in bookings:
-            if reservation.start > self.step_id:
+            if (reservation.materialized or reservation.start > self.step_id
+                    or -reservation.request_id - 1 in self._transfers):
                 continue
             request = self._requests[-reservation.request_id - 1]
             ptr = request.kv_cache_ptr
@@ -320,14 +325,19 @@ class ReservationCompactSpecScheduler(DynamicCompactSpecScheduler):
             self._reservation_event("repack_start", request.request_id, cold_pages=cold,
                                     release_event=reservation.release_event,
                                     source_pages=len(ptr.indices))
-            return
+            if not getattr(self, "reservation_transfer_queue", True):
+                return
 
     def _start_reload(self):
-        if self._transfers:
+        if self._transfers and not getattr(self, "reservation_transfer_queue", True):
             return
         table = self.reservation_table
         for reservation in sorted(table.reservations.values(), key=lambda r: (r.start, r.deadline, r.request_id)):
-            if reservation.request_id < 0 or reservation.materialized or reservation.start > self.step_id:
+            # Allocations can invalidate later bookings in this snapshot.
+            if (reservation.request_id not in table.reservations
+                    or reservation.request_id < 0 or reservation.materialized
+                    or reservation.start > self.step_id
+                    or reservation.request_id in self._transfers):
                 continue
             request = self._requests[reservation.request_id]
             ptr = request.kv_cache_ptr
@@ -349,7 +359,8 @@ class ReservationCompactSpecScheduler(DynamicCompactSpecScheduler):
             self.metrics["reservation_reload_starts"] += 1
             self._reservation_event("reload_start", request.request_id, deadline=reservation.deadline,
                                     cold_pages=ptr.cold_count, dependencies=list(reservation.dependencies))
-            return
+            if not getattr(self, "reservation_transfer_queue", True):
+                return
 
     def admit_requests(self, pending_requests):
         self._poll_retired()
@@ -463,6 +474,7 @@ class ReservationCompactSpecScheduler(DynamicCompactSpecScheduler):
         report.update(mode="vericache_reservation_compact", reservations=self.reservation_table.snapshot(
             self._projected_resident(), self.kv_pool.capacity),
                       reservation_scope="cold KV per rank; future repack releases with completion dependencies",
+                      transfer_queue_enabled=self.reservation_transfer_queue,
                       deadline_scope="predicted iteration, not a guaranteed CUDA completion time")
         return report
 

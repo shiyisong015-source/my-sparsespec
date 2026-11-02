@@ -31,11 +31,71 @@ def merged(intervals):
     return result
 
 
+class EnclosingRangeIndex:
+    """Latest-start enclosing NVTX range in O(log N), including unmatched APIs."""
+    def __init__(self, values):
+        self.values = sorted(values, key=lambda row: row[0])
+        self.starts = [row[0] for row in self.values]
+        self.size = 1 << max(0, (len(values)-1).bit_length())
+        self.ends = [-1] * (2*self.size)
+        for index, (_, end, _) in enumerate(self.values):
+            self.ends[self.size+index] = end
+        for index in range(self.size-1, 0, -1):
+            self.ends[index] = max(self.ends[2*index], self.ends[2*index+1])
+
+    def enclosing(self, start, end):
+        limit = bisect_right(self.starts, start)
+
+        def search(node, lower, upper):
+            if lower >= limit or self.ends[node] < end:
+                return None
+            if upper-lower == 1:
+                return self.values[lower][2]
+            middle = (lower+upper)//2
+            right = search(2*node+1, middle, upper)
+            return right if right is not None else search(2*node, lower, middle)
+
+        return search(1, 0, self.size)
+
+
 def latency_statistics(values):
     values=np.asarray(values,dtype=float)
     return dict(samples=len(values),measured_sum_ms=float(values.sum()),mean_ms=float(values.mean()),
                 p50_ms=float(np.percentile(values,50)),p90_ms=float(np.percentile(values,90)),
                 maximum_ms=float(values.max()))
+
+
+def distance_transfer_rows(root, case, rank):
+    match=re.search(r"_w(\d+)$",case.name)
+    if not match:
+        return []
+    parent=case.name[:match.start()]
+    path=root/parent/f"distance-swap.rank{rank}.jsonl"
+    if not path.exists():
+        return []
+    window=int(match[1])
+    with path.open() as stream:
+        return [row for line in stream if (row:=json.loads(line)).get("window_id")==window]
+
+
+def host_transfer_intervals(root, case, rank):
+    """Host submission/completion intervals, including distance-swap chunks."""
+    path=case/f"transfers.rank{rank}.jsonl"
+    intervals=[]
+    if path.exists():
+        with path.open() as stream:
+            intervals=[r for line in stream if (r:=json.loads(line))["event"]=="commit"]
+    pending={}
+    for row in distance_transfer_rows(root,case,rank):
+        if row["event"] not in ("chunk_submit","chunk_complete"):
+            continue
+        key=tuple(row[name] for name in ("request_id","generation","direction","offset"))
+        if row["event"]=="chunk_submit":
+            pending[key]=row["cpu_ns"]
+        elif key in pending:
+            intervals.append(dict(direction="repack" if row["direction"]=="down" else "restore",
+                submit_cpu_ns=pending.pop(key),commit_cpu_ns=row["cpu_ns"],scope="history_chunk"))
+    return intervals
 
 
 def component_latency_tables(root, hardware):
@@ -57,13 +117,16 @@ def component_latency_tables(root, hardware):
             "cpu_rejection_readback_and_parse":"CPU rejection readback / parse",
             "cpu_wait_for_ready":"CPU wait for ready work", "cpu_tp_control":"CPU TP control",
             "observer_window_control":"Observer window control", "repack":"KV repack / offload",
-            "restore":"KV restore"}
+            "restore":"KV restore", "history_d2h":"History chunk D2H",
+            "history_h2d":"History chunk H2D", "hot_gather":"Selected hot-view gather"}
     def append(case,rank,domain,component,cohort,unit,values,**extra):
         if values:
             order,lane={
                 "observer_window_control":(5,"CPU observer"),
                 "cpu_admission":(10,"CPU current iteration"),
                 "repack":(20,"KV async branch"),"restore":(20,"KV async branch"),
+                "history_d2h":(20,"KV async branch"),"history_h2d":(20,"KV async branch"),
+                "hot_gather":(20,"KV async branch"),
                 "cpu_wait_for_ready":(25,"CPU empty-ready-queue path"),
                 "metadata_prepare":(30,"CPU/control current iteration"),
                 "forward":(40,"GPU current forward: parent"),
@@ -129,6 +192,13 @@ def component_latency_tables(root, hardware):
             for direction in ("repack","restore"):
                 append(case.name,rank,"gpu_transfer_stream_envelope",direction,"all_window","per KV transaction",
                        [r["gpu_stream_span_ms"] for r in transfers if r["direction"]==direction])
+            swap=distance_transfer_rows(root,case,rank)
+            for direction,name in (("down","history_d2h"),("up","history_h2d")):
+                append(case.name,rank,"gpu_transfer_stream_envelope",name,"all_window","per history chunk",
+                       [r["gpu_ms"] for r in swap if r["event"]=="chunk_complete"
+                        and r.get("direction")==direction and "gpu_ms" in r])
+            append(case.name,rank,"gpu_transfer_stream_envelope","hot_gather","all_window","per selected-view construction",
+                   [r["gpu_ms"] for r in swap if r["event"]=="hot_complete"])
             fine=defaultdict(list)
             forward_names=["batch_attention_core","attention_selection_scores","mlp_input_gemm","mlp_activation",
                            "mlp_output_gemm","other_forward_kernels","tp_forward"]
@@ -201,7 +271,7 @@ def attribute_kernels(db,tables,names):
                 component=label,case=case,producer_step=int(producer),executing_step=int(executing),
                 D=int(d) if d else None,V=int(v) if v else None,P=int(p) if p else None,Q=int(q) if q else None)))
     for values in ranges.values(): values.sort(key=lambda r:r[0])
-    starts={tid:[r[0] for r in values] for tid,values in ranges.items()}
+    indices={tid:EnclosingRangeIndex(values) for tid,values in ranges.items()}
     api={}
     pid_of=lambda value:(value>>24)&0xffffff
     for table in ["CUPTI_ACTIVITY_KIND_RUNTIME","CUPTI_ACTIVITY_KIND_DRIVER"]:
@@ -209,13 +279,9 @@ def attribute_kernels(db,tables,names):
         for r in db.execute(f"SELECT start,end,globalTid,correlationId FROM {table}"):
             tid=r["globalTid"]
             if tid not in ranges: continue
-            i=bisect_right(starts[tid],r["start"])-1
-            while i>=0:
-                start,end,label=ranges[tid][i]
-                if r["end"]<=end:
-                    api[(pid_of(tid),r["correlationId"])]=label
-                    break
-                i-=1
+            label=indices[tid].enclosing(r["start"],r["end"])
+            if label is not None:
+                api[(pid_of(tid),r["correlationId"])]=label
     mapping={}
     if "TARGET_INFO_CUDA_DEVICE" in tables:
         mapping={(r["pid"],r["cudaId"]):r["gpuId"] for r in db.execute("SELECT * FROM TARGET_INFO_CUDA_DEVICE")}
@@ -251,11 +317,6 @@ def summarize_hardware(database):
     cells,component_intervals=attribute_kernels(db,tables,names)
     report["kernel_components"]=cells
     report["kernel_attribution_scope"]="Kernel -> CUDA correlation ID -> innermost NVTX range on launching CPU thread. Exclusive component labels, with no CPU launch gaps; collective kernels may still wait for peers."
-    if not {"GPU_METRICS", "TARGET_INFO_GPU_METRICS"} <= tables:
-        db.close()
-        return report
-    catalog = [dict(row) for row in db.execute("SELECT * FROM TARGET_INFO_GPU_METRICS")]
-    save(database.with_suffix(".metrics-catalog.json"), catalog)
     cases = set()
     if "NVTX_EVENTS" in tables:
         for row in db.execute("SELECT text,textId FROM NVTX_EVENTS"):
@@ -273,6 +334,11 @@ def summarize_hardware(database):
         report["cpu_cuda_blocking_api"]={name:dict(calls=len(values),total_ms=sum(values),
             median_ms=statistics.median(values)) for name,values in blocking.items()}
         report["blocking_api_scope"]="Runtime API wall duration includes runtime overhead; capture-boundary synchronizations are also present. Not pure Python CPU work."
+    if not {"GPU_METRICS", "TARGET_INFO_GPU_METRICS"} <= tables:
+        db.close()
+        return report
+    catalog = [dict(row) for row in db.execute("SELECT * FROM TARGET_INFO_GPU_METRICS")]
+    save(database.with_suffix(".metrics-catalog.json"), catalog)
     wanted = {(r["typeId"],r["metricId"]):r["metricName"] for r in catalog
               if re.search(r"SM.*Active|SM.*Issue|Tensor.*Active|DRAM|PCIe|Compute Warps|Unallocated Warps",r["metricName"],re.I)}
     series = defaultdict(list)
@@ -354,7 +420,8 @@ def analyze_case(case):
         window_delta={}
         if windowed and starts and ends:
             window_delta={key:ends[-1]["metrics"].get(key,0)-starts[0]["metrics"].get(key,0)
-                for key in ["forwards","request_verify_rounds","migrations","restores","d2h_bytes","h2d_bytes"]}
+                for key in ["forwards","request_verify_rounds","migrations","restores","d2h_bytes","h2d_bytes",
+                            "profile_verified_output_tokens", "swap_d2h_pages", "swap_h2d_pages"]}
         policy=observer.get("policy","resident")
         ordered_states=sorted(states.values(),key=lambda row:row["cpu_time_ns"])
         load={}
@@ -452,8 +519,23 @@ def analyze_case(case):
                 mean_gpu_stream_span_ms=statistics.mean(row["gpu_stream_span_ms"] for row in group) if group else None,
                 transfers_spanning_multiple_forward_submissions=sum(row["forwards_while_inflight"]>=2 for row in group),
                 mean_forwards_while_inflight=statistics.mean(row["forwards_while_inflight"] for row in group) if group else None)
+        if policy=="distance_swap":
+            swap=distance_transfer_rows(case.parent,case,rank)
+            manifest=json.loads((case.parent/f"manifest.rank{rank}.json").read_text())
+            page_bytes=manifest["kv_page_bytes_per_rank"]
+            for direction,key in (("down","swap_d2h_pages"),("up","swap_h2d_pages")):
+                group=[r for r in swap if r["event"]=="chunk_complete" and r.get("direction")==direction]
+                pages=sum(r["pages"] for r in group)
+                if pages!=window_delta.get(key,0):
+                    raise RuntimeError(f"Distance-swap chunk/native byte mismatch: {case} {direction}")
+                values=[r["gpu_ms"] for r in group if "gpu_ms" in r]
+                transfer_summary[direction]=dict(count=len(group),bytes=pages*page_bytes,
+                    measured_chunks=len(values),gpu_chunk_span_sum_ms=sum(values),
+                    mean_gpu_chunk_span_ms=statistics.mean(values) if values else None,
+                    scope="per chunk after producer dependencies; GPU span is not physical PCIe DMA time")
         completion_path=case/f"completion.rank{rank}.json"
-        outputs=json.loads(completion_path.read_text()).get("outputs",[]) if completion_path.exists() else []
+        completion=json.loads(completion_path.read_text()) if completion_path.exists() else {}
+        outputs=completion.get("outputs",[])
         output_tokens=sum(row["output_tokens"] for row in outputs)
         elapsed=metrics.get("elapsed_seconds",0)
         summaries.append(dict(rank=rank,policy=policy,metrics=metrics,steps=len(steps),decode_steps=sum(s["P"]==0 for s in steps),
@@ -465,7 +547,12 @@ def analyze_case(case):
              window_elapsed_seconds=(ends[-1]["cpu_ns"]-starts[0]["cpu_ns"])/1e9 if starts and ends else 0.,
              window_native_counter_deltas=window_delta,
              completed_requests=len(outputs),output_tokens=output_tokens,
-             end_to_end_output_tps=output_tokens/elapsed if elapsed else None,
+             end_to_end_output_tps=output_tokens/elapsed if elapsed and completion.get("complete") else None,
+             window_verified_output_tokens=(window_delta["profile_verified_output_tokens"]
+                 if starts and "profile_verified_output_tokens" in starts[0]["metrics"] else None),
+             window_verified_output_tps=(window_delta["profile_verified_output_tokens"]/
+                 ((ends[-1]["cpu_ns"]-starts[0]["cpu_ns"])/1e9)
+                 if starts and ends and "profile_verified_output_tokens" in starts[0]["metrics"] else None),
              termination_counts={name:sum(row.get("stop_reason")==name for row in outputs)
                                  for name in ["eos","serving_context_boundary","development_output_cap"]},
              transfers=transfer_summary,
@@ -473,6 +560,7 @@ def analyze_case(case):
              sampled_decode_steps=len(detailed),sampled_nvtx_decode_steps=sum(s["P"]==0 and s["fine_nvtx"] for s in steps),
              sampled_decode_components=group_summary,
              all_decode_forward_ms=[s["gpu_ms"]["forward"] for s in steps if s["P"]==0],
+             all_decode_forward_cpu_ms=[s["cpu_wall_ms"]["forward"] for s in steps if s["P"]==0 and "forward" in s["cpu_wall_ms"]],
              cpu={key:dict(samples=len(values),mean_ms=statistics.mean(values),median_ms=statistics.median(values))
                   for key in ["cpu_result_readback_and_patch","cpu_rejection_readback_and_parse","cpu_tp_control",
                               "metadata_prepare","cpu_admission","cpu_result_processing"]
@@ -510,12 +598,8 @@ def pcie_case_views(root,samples):
         lower=states[0]["cpu_time_ns"]
         upper=states[-1]["cpu_time_ns"]+100_000_000
         for rank in rank_of.values():
-            path=case/f"transfers.rank{rank}.jsonl"
-            if path.exists():
-                for line in path.open():
-                    row=json.loads(line)
-                    if row["event"]=="commit":
-                        upper=max(upper,row["commit_cpu_ns"]+100_000_000)
+            for row in host_transfer_intervals(root,case,rank):
+                upper=max(upper,row["commit_cpu_ns"]+100_000_000)
         fig,axes=plt.subplots(len(gpus)+2,1,figsize=(13,3*len(gpus)+4),sharex=True)
         report=dict(case=case.name,gpus=[])
         rank_zero=[]
@@ -523,20 +607,24 @@ def pcie_case_views(root,samples):
             rows=[r for r in telemetry[gpu] if lower<=r["cpu_time_ns"]<=upper]
             transfers=[]
             rank=rank_of.get(gpu)
-            path=case/f"transfers.rank{rank}.jsonl"
-            if rank is not None and path.exists():
-                transfers=[r for line in path.open() if (r:=json.loads(line))["event"]=="commit"]
+            if rank is not None:
+                transfers=host_transfer_intervals(root,case,rank)
             if rank==0:
                 rank_zero=transfers
             times=np.asarray([r["cpu_time_ns"] for r in rows],dtype=np.int64)
             phase=np.full(len(rows),"no_kv_inflight",dtype=object)
-            if transfers:
-                ordered=sorted(transfers,key=lambda r:r["submit_cpu_ns"])
-                starts=np.asarray([r["submit_cpu_ns"] for r in ordered],dtype=np.int64)
-                ends=np.asarray([r["commit_cpu_ns"] for r in ordered],dtype=np.int64)
-                index=np.searchsorted(starts,times,side="right")-1
-                valid=(index>=0)&(times<ends[np.maximum(index,0)])
-                phase[valid]=[ordered[i]["direction"]+"_inflight" for i in index[valid]]
+            active={}
+            for direction in ("repack","restore"):
+                spans=merged([(r["submit_cpu_ns"],r["commit_cpu_ns"]) for r in transfers if r["direction"]==direction])
+                valid=np.zeros(len(times),dtype=bool)
+                if spans:
+                    starts=np.asarray([s for s,e in spans],dtype=np.int64)
+                    ends=np.asarray([e for s,e in spans],dtype=np.int64)
+                    index=np.searchsorted(starts,times,side="right")-1
+                    valid=(index>=0)&(times<ends[np.maximum(index,0)])
+                active[direction]=valid
+                phase[valid]=direction+"_inflight"
+            phase[active["repack"] & active["restore"]]="both_directions_inflight"
             stats={}
             for key,label in [("rx_kib_per_s","RX"),("tx_kib_per_s","TX")]:
                 values=np.asarray([r[key]*1024/1e9 for r in rows])
@@ -544,7 +632,7 @@ def pcie_case_views(root,samples):
                 gaps=np.flatnonzero(np.diff(plot_t)>2.)+1
                 ax.plot(np.insert(plot_t,gaps,np.nan),np.insert(values,gaps,np.nan),label=label,lw=.9)
                 stats[label]={}
-                for name in ["all","no_kv_inflight","repack_inflight","restore_inflight"]:
+                for name in ["all","no_kv_inflight","repack_inflight","restore_inflight","both_directions_inflight"]:
                     chosen=values if name=="all" else values[phase==name]
                     stats[label][name]=dict(samples=len(chosen),
                         mean_gbps=float(chosen.mean()) if len(chosen) else None,
@@ -562,8 +650,8 @@ def pcie_case_views(root,samples):
             axes[-2].step(t,[r[name] for r in states],where="post",label=name,lw=.9)
         axes[-2].set_ylabel("Submitted requests");axes[-2].legend(loc="upper right");axes[-2].grid(alpha=.2)
         for y,direction,color in [(0,"repack","tab:orange"),(1,"restore","tab:blue")]:
-            spans=[((r["submit_cpu_ns"]-lower)/1e9,(r["commit_cpu_ns"]-r["submit_cpu_ns"])/1e9)
-                   for r in rank_zero if r["direction"]==direction]
+            spans=[((s-lower)/1e9,(e-s)/1e9) for s,e in merged([
+                (r["submit_cpu_ns"],r["commit_cpu_ns"]) for r in rank_zero if r["direction"]==direction])]
             axes[-1].broken_barh(spans,(y-.3,.6),facecolors=color)
         axes[-1].set_yticks([0,1],["Repack / D2H","Restore / H2D"])
         axes[-1].set_ylabel("KV in flight\n(rank 0 host state)")
@@ -571,7 +659,7 @@ def pcie_case_views(root,samples):
         axes[-1].grid(alpha=.2)
         fig.suptitle(f"{case.name}: PCIe interface bandwidth, submitted D/V/P and KV in flight")
         fig.tight_layout(rect=[0,0,1,.97]);fig.savefig(case/"pcie-bandwidth.png",dpi=160);plt.close(fig)
-        report["scope"]="Decimal GB/s from NVML interface samples; includes KV, TP and metadata. In-flight phases use per-rank host submit/commit times, not exact GPU execution intervals. Sparse/boundary samples cannot establish a physical bandwidth ceiling or isolate KV-only traffic."
+        report["scope"]="Decimal GB/s from NVML interface samples; includes KV, TP and metadata. In-flight phases use per-rank host submit/commit times (distance-swap: per chunk), not exact GPU execution intervals. Both directions may overlap. Sparse/boundary samples cannot establish a physical bandwidth ceiling or isolate KV-only traffic."
         save(case/"pcie-bandwidth.json",report)
         reports.append(report)
     return reports

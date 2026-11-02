@@ -176,6 +176,18 @@ class AsyncCPUCompactSpecScheduler(AsyncCompactSpecScheduler):
         self.metrics["cpu_result_update_wall_seconds"] += time.perf_counter() - started
         return completed, consumed
 
+    def _on_compute_submitted(self, requests, phases, model_done):
+        """Optional residency owner notification after metadata has been sealed."""
+
+    def _drain_pipeline_transfers(self):
+        """Drain independent transfer owners before final pool accounting."""
+
+    def _before_pipeline_cleanup(self):
+        """Stop external producers before streams and request storage are drained."""
+
+    def _after_pipeline_streams_drained(self):
+        """Release independent residency owners on exceptional/early exit."""
+
     def run(self, pending_requests):
         pending_requests = list(pending_requests)
         for identity, request in enumerate(pending_requests):
@@ -233,6 +245,7 @@ class AsyncCPUCompactSpecScheduler(AsyncCompactSpecScheduler):
                     for request in computing:
                         self._compute_fences[request.request_id] = model_done
                         self._last_served[request.request_id] = self.step_id
+                    self._on_compute_submitted(computing, phases, model_done)
                     self.metrics["cpu_pipeline_submissions"] += 1
                     self._record_peak()
                 else:
@@ -261,6 +274,7 @@ class AsyncCPUCompactSpecScheduler(AsyncCompactSpecScheduler):
                     previous = None
                 if self.step_id % 100 == 0:
                     self._write_transfer_timing()
+            self._drain_pipeline_transfers()
             self.compute_stream.synchronize()
             torch.cuda.current_stream(self.kv_pool.device).synchronize()
             self._poll_retired()
@@ -279,8 +293,10 @@ class AsyncCPUCompactSpecScheduler(AsyncCompactSpecScheduler):
             self._abort_failed_tp_worker()
             raise
         finally:
+            self._before_pipeline_cleanup()
             self.compute_stream.synchronize()
             torch.cuda.current_stream(self.kv_pool.device).synchronize()
+            self._after_pipeline_streams_drained()
             # Restore original Request.retire before ordinary cleanup. Strong
             # retired references remain valid until both streams finish.
             for request in self._patched_requests:

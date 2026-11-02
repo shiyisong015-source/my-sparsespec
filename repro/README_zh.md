@@ -2,7 +2,7 @@
 
 本次迁移快照更新到 2026-11-02，包含预约调度、KV 恢复 kernel、组件 profile 与诊断脚本；环境安装沿用 2026-10-20 的锁定版本。下文的接受长度实验是 Qwen3-8B、TP2、FP16、thinking 开启、temperature=0.6、seed=330，CUDA Graph、CPU 异步调度及 KV 异步传输开启。组件 profile 则使用 TP1、k8、r=.05、eager，不能混为相同实验配置。
 
-迁移当前组件 profile 请先读 [profile-migration_zh.md](profile-migration_zh.md)：其中提供不依赖旧服务器绝对路径和历史 log 输入的运行命令。旧硬件采集 shell 为参考机专用入口。
+迁移最新距离交换策略及 0.9 总预算对照请先读 [distance-swap-handoff_zh.md](distance-swap-handoff_zh.md)，其中包含最新准入行为、标定方法与可迁移运行命令。[profile-migration_zh.md](profile-migration_zh.md) 保留早期预约版迁移流程；旧硬件采集 shell 为参考机专用入口。
 
 ## 1. 获取代码
 

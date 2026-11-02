@@ -26,16 +26,22 @@ import torch.distributed as dist
 
 from serve.distribute.tp import setup_tp_worker
 from serve.model.graph_model import CUDAGraphModelWrapper
+from serve.model.config import ModelArgs
 from serve.model.model import Attention, FeedForward, KVPool, Transformer
 from serve.request.kv_cache_ptr.compact import CompactCachePtr
 from serve.request.request import Request
 from serve.sampling.rejection_sampler import RejectionSampler
 from serve.scheduler.dynamic_compact_scheduler import DynamicCompactSpecScheduler
 from serve.scheduler.reservation_scheduler import ReservationCompactSpecScheduler
+from serve.scheduler.distance_swap_scheduler import DistanceSwapSpecScheduler
 from serve.utils import setup_seed
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_INPUT = REPO / "log/acceptance-u-k32-dynamic-20261020/full128-mem075/r0.05/lcb128-natural/worker-payload.json"
+
+
+class ProfileWindowsComplete(Exception):
+    """TP1 capture stop: drain storage without manufacturing EOS results."""
 
 
 def save(path, value):
@@ -183,6 +189,7 @@ class ObservationMixin:
                                 if observation.get("policy") == "reservation" else None)
         self.idle_recorder, self.idle_timeline = self.recorder, self.verify_timeline
         self.verify_batch_ids = []
+        self.metrics["profile_verified_output_tokens"] = 0
 
     def _open_profile_window(self):
         self.output = self.case_output.parent/f"{self.case_output.name}_w{self.window_index:02d}"
@@ -211,6 +218,10 @@ class ObservationMixin:
         self.compute_stream.synchronize()
         self.transfer_stream.synchronize()
         torch.cuda.current_stream(self.kv_pool.device).synchronize()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(self.kv_pool.device)
+        non_torch = max(0, total_bytes-free_bytes-torch.cuda.memory_reserved(self.kv_pool.device))
+        self.metrics["non_torch_peak_observed_bytes"] = max(
+            self.metrics.get("non_torch_peak_observed_bytes",0),non_torch)
         if start:
             self._open_profile_window()
         # profilerStop may block on collector bookkeeping. Its own overhead
@@ -301,6 +312,8 @@ class ObservationMixin:
             self.capture_finished=self.windows_completed>=self.observation.get("record_windows",1)
             self.next_window_at=(time.perf_counter()-self._run_start_perf_counter
                                  +self.observation.get("window_gap_seconds",180.))
+            if self.capture_finished and self.observation.get("windows_only", False):
+                raise ProfileWindowsComplete()
 
     def admit_requests(self, pending):
         self.recorder.drain()
@@ -351,8 +364,7 @@ class ObservationMixin:
                 context_median=self.last_context_median, pending_requests=self.pending_count,
                 live_requests=len(self._requests), waiting_requests=len(self.offload_requests),
                 cpu_cold_pages=self._current_cpu(),
-                transfers=[dict(request_id=key,direction=job.direction,cold_pages=job.cold_pages)
-                           for key,job in self._transfers.items()]))
+                transfers=self._pending_transfer_snapshot()))
             self.verify_batch_ids = [r["request_id"] for r in details if r["phase"] == "VERIFY"]
             if counts["NORMAL"] == 0:
                 self.decode_forwards += 1
@@ -386,8 +398,11 @@ class ObservationMixin:
             self.draft_start[request.request_id] = (
                 request.len_kv_cache, request.kv_cache_ptr.len_loading_indices, False)
             self.partial_acceptance_rounds_skipped += 1
+            self.metrics["profile_verified_output_tokens"] += len(args[0] if args else kwargs["output_token_ids"])
             return result
-        return super().verify_outputs(request, *args, **kwargs)
+        result = super().verify_outputs(request, *args, **kwargs)
+        self.metrics["profile_verified_output_tokens"] += len(args[0] if args else kwargs["output_token_ids"])
+        return result
 
     def update_metadata_host(self, *args, **kwargs):
         with self.recorder.measure("cpu_result_readback_and_patch"):
@@ -399,13 +414,29 @@ class ObservationMixin:
         boundary=(request.len_kv_cache+check_idx>=request.len_oracle_ctx-1
                   if request.status==Request.ReqExecType.NORMAL
                   else request.len_kv_cache>=request.len_oracle_ctx)
+        length_before = request.len_token_ids
         complete=super().is_request_complete(request,check_idx=check_idx)
         if complete:
+            self.metrics["profile_verified_output_tokens"] -= length_before-request.len_token_ids
             request.profile_stop_reason="boundary" if boundary else "eos"
         return complete
 
     def run(self, pending):
-        result = super().run(pending)
+        pending = list(pending)
+        try:
+            result = super().run(pending)
+        except ProfileWindowsComplete:
+            # The native pipeline's finally block has joined transfer workers,
+            # drained streams, and retired storage before this handler runs.
+            result = [r for r in pending if hasattr(r, "profile_stop_reason")]
+            self.metrics.update(profile_windows_only=True,
+                elapsed_seconds=time.perf_counter()-self._run_start_perf_counter,
+                gpu_final_free_pages=self.kv_pool.num_free_pages,
+                gpu_capacity_pages=self.kv_pool.capacity)
+            if self.kv_pool.num_free_pages != self.kv_pool.capacity:
+                raise RuntimeError("Windows-only profile leaked GPU pages")
+            self.transfer_timing_snapshot(self.metrics["elapsed_seconds"])
+            self._write_transfer_timing(self.metrics["elapsed_seconds"],complete=False)
         if self.capture_active:
             self._capture_boundary(False)
             self.capture_active = False
@@ -439,6 +470,86 @@ class ObservationMixin:
         return result
 
 
+class ObservedDistanceSwap(ObservationMixin, DistanceSwapSpecScheduler):
+    def _open_profile_window(self):
+        super()._open_profile_window()
+        self.verify_timeline = VerifyTimeline(self.output/f"verify-timeline.rank{self.rank}.jsonl", self.rank)
+        self.window_contexts[-1]["timeline"] = self.verify_timeline
+
+    def _capture_boundary(self, start):
+        with self._residency_lock:
+            self._swap.transport.synchronize()
+            self._swap.poll()
+            self.metrics.update(self._swap.metrics)
+            result = super()._capture_boundary(start)
+            self._swap.transport.measure = start
+            return result
+
+    def _swap_event(self, row):
+        row = dict(row, window_id=self.window_index if self.capture_active else None)
+        super()._swap_event(row)
+        if self.verify_timeline is not None and self.verify_timeline.active:
+            identity = row.get("request_id")
+            if row["event"] == "chunk_submit" and row.get("direction") == "up":
+                self.verify_timeline.note("restore_submitted", identity, offset=row["offset"], pages=row["pages"])
+            elif row["event"] == "chunk_complete" and row.get("direction") == "up":
+                storage = self._swap.storages[identity]
+                if storage.complete:
+                    self.verify_timeline.note("restore_ready_observed", identity)
+                    self.verify_timeline.note("restore_page_table_committed", identity)
+
+    def _observe_verify_needs(self, carry_in=False):
+        for request in self._requests.values():
+            self.verify_timeline.observe(request.request_id, request.status.name, carry_in=carry_in,
+                step=self.step_id, logical_tokens=request.len_kv_cache,
+                cache_phase=getattr(request.kv_cache_ptr,"phase","prefill"))
+
+    def _observe_verify_waits(self):
+        selected = {r.request_id for r in self.active_requests if r.status.name == "VERIFY"}
+        for request in self._requests.values():
+            if request.status.name != "VERIFY":
+                continue
+            storage = self._swap.storages.get(request.request_id)
+            if storage is None or not storage.hot_ready:
+                reason = "hot_view_initialization"
+            elif any(c.job is not None and c.job.direction == "up" for c in storage.chunks):
+                reason = "restore_inflight"
+            elif not storage.complete:
+                reason = "restore_priority_or_pages"
+            elif request.request_id in selected:
+                reason = "batch_preparation"
+            else:
+                reason = "ready_not_selected"
+            self.verify_timeline.wait(request.request_id, reason, step=self.step_id,
+                missing_pages=storage.missing if storage is not None else None,
+                free_pages=self.kv_pool.num_free_pages, reserve_pages=self._swap.reserve)
+
+    def _verify_forward_submit(self):
+        if self.verify_timeline is not None:
+            for identity in self.verify_batch_ids:
+                self.verify_timeline.submit_verify(identity, self.step_id)
+
+    def update_requests(self, *args, **kwargs):
+        result = super().update_requests(*args, **kwargs)
+        if self.verify_timeline is not None and self.verify_timeline.active:
+            self._observe_verify_needs()
+        return result
+
+    def verify_outputs(self, request, *args, **kwargs):
+        result = super().verify_outputs(request, *args, **kwargs)
+        if self.verify_timeline is not None:
+            self.verify_timeline.result(request.request_id)
+        return result
+
+    def _pending_transfer_snapshot(self):
+        with self._residency_lock:
+            return [dict(request_id=identity, generation=storage.generation,
+                         direction=chunk.job.direction, offset=chunk.offset,
+                         pages=chunk.count, bytes=chunk.count*self.page_bytes)
+                    for identity, storage in self._swap.storages.items()
+                    for chunk in storage.chunks if chunk.job is not None]
+
+
 class ObservedResident(ObservationMixin, DynamicCompactSpecScheduler):
     def _submit_transfer(self, request, direction):
         raise RuntimeError(f"No-offload diagnostic attempted {direction}; provision a larger resident pool")
@@ -455,6 +566,13 @@ class ObservedReservation(ObservationMixin, ReservationCompactSpecScheduler):
         self.observed_transfers = {}
         self.transfer_sequence = 0
         self.completed_transfer_events = deque()
+
+    def _capture_boundary(self, start):
+        self.compute_stream.synchronize()
+        self.transfer_stream.synchronize()
+        torch.cuda.current_stream(self.kv_pool.device).synchronize()
+        self._poll_transfers()
+        return super()._capture_boundary(start)
 
     def _observe_verify_needs(self, carry_in=False):
         for request in self._requests.values():
@@ -506,7 +624,7 @@ class ObservedReservation(ObservationMixin, ReservationCompactSpecScheduler):
             elif booking is None:
                 reason = "reservation_unassigned"
             elif ptr.phase == "hot":
-                if self._transfers:
+                if self._transfers and not self.reservation_transfer_queue:
                     reason = "transfer_busy"
                 elif booking.start > self.step_id:
                     reason = "reservation_not_started"
@@ -755,6 +873,10 @@ def calibrate_transfer_bandwidth(pool, group, output, rank):
 
 def main(args):
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
+    if args.policy == "distance_swap" and world != 1:
+        raise ValueError("distance_swap profile currently requires TP1")
+    if args.windows_only and world != 1:
+        raise ValueError("windows-only profile currently requires TP1")
     device = f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}"
     torch.cuda.set_device(device)
     torch.set_default_dtype(torch.float16)
@@ -777,12 +899,26 @@ def main(args):
     # diagnostic never consumes it. It otherwise parks small resident tests.
     workspace_pages = max(192, math.ceil(max(len(r["input_ids"]) + cap
                                            + 2 * args.stride + 3 for r,cap in zip(rows,caps)) * .05)) + args.stride + 1
-    capacity = args.pool_pages if args.policy=="reservation" else known_pages + workspace_pages
+    gpu_total_bytes = torch.cuda.get_device_properties(device).total_memory
+    budget_cfg = ModelArgs.from_name(args.model)
+    model_budget_bytes = int(budget_cfg.element_size() * 2)  # Match serve/run.py's FP16 estimate.
+    page_budget_bytes = budget_cfg.num_layers * 2 * budget_cfg.num_kv_heads * budget_cfg.head_dim * 2
+    if args.mem_fraction is not None:
+        if args.policy == "resident":
+            raise ValueError("Resident diagnostic uses its explicit all-request pool; select a transfer policy for --mem-fraction")
+        capacity = int((gpu_total_bytes * args.mem_fraction - model_budget_bytes
+                        - args.runtime_reserve_bytes) / page_budget_bytes)
+        if capacity < 1:
+            raise ValueError("Configured memory fraction leaves no KV capacity after model weights")
+        pool_budget_scope = "GPU fraction minus native FP16 model estimate and explicit measured runtime reserve"
+    else:
+        capacity = (args.pool_pages if args.pool_pages is not None else 262144) if args.policy!="resident" else known_pages + workspace_pages
+        pool_budget_scope = "explicit original-pool pages" if args.policy!="resident" else "all-request resident diagnostic"
     buffer_batch_capacity=args.buffer_batch_capacity or max(args.batches)
     if buffer_batch_capacity<max(args.batches):
         raise ValueError("Buffer batch capacity must cover every scanned batch limit")
-    cpu_capacity=(buffer_batch_capacity+1)*(context_limit+args.stride+1) if args.policy=="reservation" else capacity
-    if args.policy=="reservation" and capacity<context_limit+workspace_pages+args.stride+1:
+    cpu_capacity=(buffer_batch_capacity+1)*(context_limit+args.stride+1) if args.policy!="resident" else capacity
+    if args.policy!="resident" and capacity<context_limit+workspace_pages+args.stride+1:
         raise ValueError("Pool must fit one full serving context plus native repack workspace")
     model = Transformer.from_pretrained(args.model, device=device, dtype=torch.float16)
     model = setup_tp_worker(model, world, device, torch.float16, "customized")
@@ -806,12 +942,19 @@ def main(args):
         input_sha256=hashlib.sha256(args.input.read_bytes()).hexdigest(),
         request_ids=[r["sample_id"] for r in rows], input_lengths=[len(r["input_ids"]) for r in rows],
         pool_pages=capacity, known_pages=known_pages, policy_workspace_pages=workspace_pages,
+        pool_budget_scope=pool_budget_scope, mem_fraction=args.mem_fraction,
+        gpu_total_bytes=gpu_total_bytes, model_budget_estimate_bytes=model_budget_bytes,
+        runtime_reserve_bytes=args.runtime_reserve_bytes,
         serving_context_limit=context_limit,output_caps=caps,
         termination_policy="natural_eos_or_serving_context_boundary" if args.output_tokens is None else "explicit_development_output_cap",
         cpu_capacity_pages=cpu_capacity,cpu_logical_budget_bytes_per_rank=cpu_capacity*page_bytes,
-        cpu_allocation="lazy per-request pinned cold backing, not preallocated to logical budget",
-        reservation_bandwidth_gbps=bandwidth,reservation_iteration_ms=args.reservation_iteration_ms,
-        iteration_estimate_source=args.reservation_iteration_source,
+        cpu_allocation=("lazy chronological prefix chunks including selected KV"
+                        if args.policy=="distance_swap" else
+                        "lazy per-request pinned cold backing, not preallocated to logical budget"),
+        reservation_bandwidth_gbps=bandwidth,
+        reservation_iteration_ms=args.reservation_iteration_ms if args.policy=="reservation" else None,
+        iteration_estimate_source=args.reservation_iteration_source if args.policy=="reservation" else None,
+        reservation_transfer_queue=args.reservation_transfer_queue,
         kv_page_bytes_per_rank=page_bytes,kv_pool_bytes_per_rank=capacity*page_bytes,
         probability_rows=RejectionSampler.MAX_SPEC_LEN,
         buffer_batch_capacity=buffer_batch_capacity,
@@ -820,7 +963,9 @@ def main(args):
                        for path in [Path(__file__).resolve(),Path(__file__).with_name("verify_timeline.py").resolve(),
                                     *sorted((REPO/"serve").rglob("*.py"))]},
         scope=("Implemented VeriCache BW/HBM reservations, real cached LiveCodeBench prompts, native CPU/transfer async, eager; natural EOS unless an explicit development cap is supplied."
-               if args.policy=="reservation" else "Development-only resident no-offload profile, explicitly capped."))
+               if args.policy=="reservation" else
+               "TP1 next-Verify cold-history replacement; chronological CPU backing, independent chunked transfer worker and per-window transfer GPU events."
+               if args.policy=="distance_swap" else "Development-only resident no-offload profile, explicitly capped."))
     save(args.output/f"manifest.rank{rank}.json", manifest)
     stop = threading.Event()
     telemetry_event = threading.Event()
@@ -836,9 +981,11 @@ def main(args):
                 case.mkdir(exist_ok=True)
                 setup_seed(330)
                 pool.phase_idx = 0
-                worker_class=ObservedReservation if args.policy=="reservation" else ObservedResident
+                worker_class={"reservation":ObservedReservation, "resident":ObservedResident,
+                              "distance_swap":ObservedDistanceSwap}[args.policy]
                 reservation_args=dict(compact_reservation=True,reservation_bandwidth_gbps=bandwidth,
                     reservation_iteration_ms=args.reservation_iteration_ms,reservation_horizon=64,
+                    reservation_transfer_queue=args.reservation_transfer_queue,
                     reservation_target_length=args.stride) if args.policy=="reservation" else {}
                 worker = worker_class(pool, CUDAGraphModelWrapper(model), **dict(spec,max_batch_size=batch),
                     observation=dict(output=str(case),detail_every=args.detail_every,capture=args.capture,
@@ -848,20 +995,28 @@ def main(args):
                                      window_check_steps=args.window_check_steps,
                                      minimum_forwards=args.minimum_forwards,
                                      minimum_restores=args.minimum_restores if args.policy=="reservation" else 0,
+                                     windows_only=args.windows_only,
                                      telemetry_event=telemetry_event),
                     eos_token_id=[151645,151643], admit_policy="offloading", async_cpu=True, tp_ranks=world,
                     temperature=.6, enable_torch_profiler=False, profiler_result_dir=str(case),
                     batch_policy="greedy", enable_cuda_graph=False, chunk_size=256,
                     trace_name="component-profile",kv_cache="compact", compact_cpu_pages=cpu_capacity,
                     compact_async_transfers=True, compact_control_group=group, compact_debug_checks=False,
-                    compact_dynamic_admission=True, max_num_batched_tokens=args.query_budget,
+                    compact_dynamic_admission=args.policy!="distance_swap",
+                    compact_distance_swap=args.policy=="distance_swap",
+                    distance_swap_chunk_pages=args.distance_swap_chunk_pages,
+                    max_num_batched_tokens=args.query_budget,
                     acceptance_log_path=None,**reservation_args)
                 print("COMPONENT_CASE_START",rank,batch,flush=True)
                 results = worker.run([Request(r["input_ids"],cap) for r,cap in zip(rows,caps)])
                 worker.close_acceptance_log()
                 worker.step_trace.close(True)
-                assert len(results)==len(rows) and pool.num_free_pages==pool.capacity
-                completion=dict(complete=True,
+                assert pool.num_free_pages==pool.capacity
+                if not args.windows_only:
+                    assert len(results)==len(rows)
+                completion=dict(complete=len(results)==len(rows),
+                     termination_scope="windows_only" if worker.metrics.get("profile_windows_only") else "all_requests",
+                     unfinished_request_ids=sorted(set(range(len(rows)))-{r.request_id for r in results}),
                      outputs=[dict(id=r.request_id,sample_id=rows[r.request_id]["sample_id"],
                                    input_tokens=r.len_input,output_tokens=r.len_token_ids-r.len_input,
                                    output_cap=r.len_output,
@@ -893,12 +1048,19 @@ if __name__=="__main__":
     parser.add_argument("--input",type=Path,default=DEFAULT_INPUT)
     parser.add_argument("--model",default="/data/models/Qwen3-8B")
     parser.add_argument("--stride",type=int,default=8)
-    parser.add_argument("--policy",choices=["reservation","resident"],default="reservation")
+    parser.add_argument("--policy",choices=["reservation","resident","distance_swap"],default="reservation")
+    parser.add_argument("--distance-swap-chunk-pages",type=int,default=256)
     parser.add_argument("--requests",type=int,default=128)
     parser.add_argument("--output-tokens",type=int,default=None,help="Development checks only; omitted in the formal natural-EOS run")
     parser.add_argument("--context-limit",type=int,default=32768,help="Serving total-context boundary, retained from aligned natural-EOS experiments")
-    parser.add_argument("--pool-pages",type=int,default=262144,help="Fixed GPU KV pool shared by all batch configurations")
+    memory=parser.add_mutually_exclusive_group()
+    memory.add_argument("--pool-pages",type=int,default=None,help="Fixed GPU KV pool pages; default 262144 if no fraction supplied")
+    memory.add_argument("--mem-fraction",type=float,default=None,
+                        help="Native model+KV fraction: floor((GPU bytes*fraction - estimated FP16 model bytes)/page bytes)")
+    parser.add_argument("--runtime-reserve-bytes",type=int,default=0,
+                        help="Measured non-model/non-KV GPU peak reserved inside --mem-fraction before allocating KV")
     parser.add_argument("--query-budget",type=int,default=2048)
+    parser.add_argument("--reservation-transfer-queue",action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument("--reservation-iteration-ms",type=float,default=33.4)
     parser.add_argument("--reservation-iteration-source",default="Initial estimate from prior TP2 eager k8 profile; not calibrated for other TP sizes or a deadline guarantee")
     parser.add_argument("--batches",type=int,nargs="+",default=[16,32,48,64,72,128])
@@ -907,6 +1069,8 @@ if __name__=="__main__":
     parser.add_argument("--detail-every",type=int,default=8,help="Approximate inverse fine-NVTX sampling rate within the recording window")
     parser.add_argument("--fine-gpu-events",action="store_true",help="Diagnostic only: per-layer events perturb eager launches")
     parser.add_argument("--capture",action="store_true")
+    parser.add_argument("--windows-only",action="store_true",
+                        help="TP1: stop and safely release storage after the requested windows; leave unfinished requests incomplete")
     parser.add_argument("--warmup-seconds",type=float,default=120.)
     parser.add_argument("--record-seconds",type=float,default=180.)
     parser.add_argument("--record-windows",type=int,default=1)
@@ -915,8 +1079,14 @@ if __name__=="__main__":
     parser.add_argument("--minimum-forwards",type=int,default=12)
     parser.add_argument("--minimum-restores",type=int,default=2)
     args=parser.parse_args()
-    if min(args.requests,args.detail_every,args.window_check_steps,args.minimum_forwards,args.context_limit,args.pool_pages,*args.batches)<1:
+    if min(args.requests,args.detail_every,args.window_check_steps,args.minimum_forwards,args.context_limit,*args.batches)<1:
         parser.error("Positive request/iteration sizes required")
+    if args.pool_pages is not None and args.pool_pages < 1:
+        parser.error("Pool pages must be positive")
+    if args.mem_fraction is not None and (not math.isfinite(args.mem_fraction) or not 0 < args.mem_fraction <= 1):
+        parser.error("Memory fraction must be finite and within (0,1]")
+    if args.runtime_reserve_bytes < 0 or (args.runtime_reserve_bytes and args.mem_fraction is None):
+        parser.error("Nonnegative runtime reserve requires --mem-fraction")
     if args.output_tokens is not None and args.output_tokens<1:
         parser.error("Development output cap must be positive")
     if args.policy=="resident" and args.output_tokens is None:
@@ -925,6 +1095,8 @@ if __name__=="__main__":
         parser.error("Require query budget >= k+1 and a finite positive iteration estimate")
     if not math.isfinite(args.warmup_seconds) or args.warmup_seconds<0 or not math.isfinite(args.record_seconds) or args.record_seconds<=0:
         parser.error("Require finite warmup >= 0 and recording duration > 0")
+    if args.distance_swap_chunk_pages < 1:
+        parser.error("Distance-swap chunk size must be positive")
     if args.minimum_restores<0:
         parser.error("Minimum restores must be nonnegative")
     if args.record_windows<1 or not math.isfinite(args.window_gap_seconds) or args.window_gap_seconds<0:

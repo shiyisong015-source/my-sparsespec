@@ -1,8 +1,8 @@
 """On-demand KV transfers with request readiness and deferred page release.
 
 The native model/sampling/rejection path remains synchronous on its compute
-stream. A separate stream carries one bounded KV transaction at a time;
-ready requests continue computing while that transaction is in flight.
+stream. A separate stream serializes KV transactions; the reservation policy
+can enqueue multiple requests while ready requests continue computing.
 """
 from dataclasses import dataclass
 import math
@@ -58,7 +58,9 @@ class AsyncCompactSpecScheduler(CompactSpecScheduler):
                     + self.spec_stride + 1 for r in requests), default=0)
 
     def _submit_transfer(self, request, direction):
-        if self._transfers:
+        if request.request_id in self._transfers:
+            raise RuntimeError("A request already has a KV transaction in flight")
+        if self._transfers and not getattr(self, "reservation_transfer_queue", False):
             raise RuntimeError("Only one KV transaction may be in flight")
         ptr = request.kv_cache_ptr
         source_pages = len(ptr.indices)

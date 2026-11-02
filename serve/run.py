@@ -106,7 +106,10 @@ def run_spec_scheduler(
     logger.info(f"Running SpecScheduler with args: {args}")
 
     if args["kv_cache"] == "compact":
-        if args.get("compact_reservation"):
+        if args.get("compact_distance_swap"):
+            from serve.scheduler.distance_swap_scheduler import DistanceSwapSpecScheduler
+            worker = DistanceSwapSpecScheduler(kv_pool, model, **args)
+        elif args.get("compact_reservation"):
             from serve.scheduler.reservation_scheduler import ReservationCompactSpecScheduler
             worker = ReservationCompactSpecScheduler(kv_pool, model, **args)
         elif args.get("compact_dynamic_admission"):
@@ -207,11 +210,25 @@ def run_inference(
     compact_cpu_admit_fraction: float = 1.,
     compact_selected_capacity: int = 6 * 1024,
     compact_reservation: bool = False,
+    compact_distance_swap: bool = False,
+    distance_swap_chunk_pages: int = 256,
     reservation_bandwidth_gbps: float = None,
     reservation_iteration_ms: float = None,
     reservation_horizon: int = 64,
+    reservation_transfer_queue: bool = True,
     reservation_target_length: int = None,
 ):
+    if compact_distance_swap:
+        if cuda_graph:
+            raise ValueError("distance_swap currently requires eager execution")
+        if compact_reservation or compact_dynamic_admission:
+            raise ValueError("Select only one compact scheduling policy")
+        if tp_ranks != 1:
+            raise ValueError("distance_swap currently requires TP1")
+        if type(distance_swap_chunk_pages) is not int or distance_swap_chunk_pages < 1:
+            raise ValueError("distance_swap_chunk_pages must be positive")
+        if compact_early_verify_length is not None:
+            raise ValueError("distance_swap preserves the native k boundary")
     if compact_reservation:
         if kv_cache != "compact" or not compact_async_transfers or not async_cpu:
             raise ValueError("Reservations require compact KV with CPU and transfer async enabled")
@@ -229,7 +246,7 @@ def run_inference(
     elif (reservation_bandwidth_gbps is not None or reservation_iteration_ms is not None
           or reservation_target_length is not None or reservation_horizon != 64):
         raise ValueError("Reservation parameters require compact_reservation=True")
-    if compact_dynamic_admission or compact_reservation:
+    if compact_dynamic_admission or compact_reservation or compact_distance_swap:
         if kv_cache != "compact" or not compact_async_transfers or not async_cpu:
             raise ValueError("Dynamic admission requires compact KV with CPU and transfer async enabled")
         if (type(max_num_batched_tokens) is not int
@@ -432,9 +449,12 @@ def run_inference(
         "compact_cpu_admit_fraction": compact_cpu_admit_fraction,
         "compact_selected_capacity": compact_selected_capacity,
         "compact_reservation": compact_reservation,
+        "compact_distance_swap": compact_distance_swap,
+        "distance_swap_chunk_pages": distance_swap_chunk_pages,
         "reservation_bandwidth_gbps": reservation_bandwidth_gbps,
         "reservation_iteration_ms": reservation_iteration_ms,
         "reservation_horizon": reservation_horizon,
+        "reservation_transfer_queue": reservation_transfer_queue,
         "reservation_target_length": reservation_target_length,
     }
 
@@ -804,12 +824,16 @@ if __name__ == "__main__":
                            help="Optional draft-count trigger; otherwise terminate early only under KV pressure")
     argparser.add_argument("--compact_cpu_admit_fraction", type=float, default=1.,
                            help="Pause fresh prompts at this fraction of the CPU cold-page budget")
+    argparser.add_argument("--compact_distance_swap", action="store_true",
+                           help="TP1 next-Verify history replacement with an independent chunked transfer worker")
+    argparser.add_argument("--distance_swap_chunk_pages", type=int, default=256)
     argparser.add_argument("--compact_reservation", action="store_true",
                            help="VeriCache-style BW/HBM lookahead reservations on compact KV")
     argparser.add_argument("--reservation_bandwidth_gbps", type=float, default=None,
                            help="Measured effective transfer bandwidth PER TP RANK, decimal GB/s")
     argparser.add_argument("--reservation_iteration_ms", type=float, default=None,
                            help="Profiled iteration duration used by the reservation calendar")
+    argparser.add_argument("--reservation_transfer_queue", action=argparse.BooleanOptionalAction, default=True)
     argparser.add_argument("--reservation_horizon", type=int, default=64,
                            help="Number of scheduler windows in both reservation rings")
     argparser.add_argument("--reservation_target_length", type=int, default=None,
@@ -882,8 +906,11 @@ if __name__ == "__main__":
         compact_cpu_admit_fraction=args.compact_cpu_admit_fraction,
         compact_selected_capacity=args.compact_selected_capacity,
         compact_reservation=args.compact_reservation,
+        compact_distance_swap=args.compact_distance_swap,
+        distance_swap_chunk_pages=args.distance_swap_chunk_pages,
         reservation_bandwidth_gbps=args.reservation_bandwidth_gbps,
         reservation_iteration_ms=args.reservation_iteration_ms,
         reservation_horizon=args.reservation_horizon,
+        reservation_transfer_queue=args.reservation_transfer_queue,
         reservation_target_length=args.reservation_target_length,
     )
