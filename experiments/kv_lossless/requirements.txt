@@ -1,0 +1,4 @@
+nvidia-nvcomp-cu12==5.3.0.16
+nvidia-libnvcomp-cu12==5.3.0.16
+lz4==4.4.5
+zstandard==0.25.0

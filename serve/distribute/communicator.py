@@ -41,7 +41,7 @@ class CudaCommunicator:
                 self.communicator = CustomAllreduce(
                     group=customized_group, device=self.device
                 )
-                self.reducer = lambda x: self.communicator.custom_all_reduce(x)
+                self.reducer = self._custom_or_nccl
             case _:
                 raise ValueError(f"Unsupported method: {method}")
 
@@ -64,6 +64,17 @@ class CudaCommunicator:
     def all_reduce(self, input_):
         assert self.reducer is not None, "Reducer is not initialized."
         out = self.reducer(input_)
+        return out
+
+    def _custom_or_nccl(self, input_):
+        # The custom IPC buffers have a strict size/alignment/layout limit.
+        # Valid model batches can exceed it (2048 FP16 x 4096 = 16 MiB).
+        if self.communicator.should_custom_ar(input_):
+            return self.communicator.custom_all_reduce(input_)
+        # Keep the custom path's out-of-place contract. All TP ranks use the
+        # same input geometry and therefore choose the same collective path.
+        out = input_.clone()
+        dist.all_reduce(out, group=self.device_group)
         return out
 
     def __del__(self):

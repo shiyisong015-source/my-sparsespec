@@ -1,6 +1,8 @@
 # 在另一台服务器运行当前 SparseSpec 研究版本
 
-本目录对应 2026-10-20 的代码与实验环境。主实验是 Qwen3-8B、TP2、FP16、thinking 开启、temperature=0.6、seed=330，CUDA Graph、CPU 异步调度及 KV 异步传输开启。运行的是改动版 SparseSpec self-spec。
+本次迁移快照更新到 2026-11-02，包含预约调度、KV 恢复 kernel、组件 profile 与诊断脚本；环境安装沿用 2026-10-20 的锁定版本。下文的接受长度实验是 Qwen3-8B、TP2、FP16、thinking 开启、temperature=0.6、seed=330，CUDA Graph、CPU 异步调度及 KV 异步传输开启。组件 profile 则使用 TP1、k8、r=.05、eager，不能混为相同实验配置。
+
+迁移当前组件 profile 请先读 [profile-migration_zh.md](profile-migration_zh.md)：其中提供不依赖旧服务器绝对路径和历史 log 输入的运行命令。旧硬件采集 shell 为参考机专用入口。
 
 ## 1. 获取代码
 
@@ -113,13 +115,19 @@ Qwen3-8B FP16/TP2 每页每rank为73,728字节，默认 CPU KV 池预算约69.77
 
 ## 6. 记录和分析
 
+默认关闭额外的概率、u、选集分数、完整词表和采样噪声采集，不挂载对应 observer，
+不复制这些诊断张量到 CPU、不保留额外噪声副本，也不执行依赖这些文件的信号校验。
+推理本身的 logits、概率、随机采样和 rejection 不受影响，已生成的历史数据保留。
+只有显式指定 `--record-signals` 才重新开启信号采集；`--full-vocab-trace` 和
+`--trace-top-k` 还必须与 `--record-signals` 一起使用。
+
 每档输出到 `log/.../r0.05/lcb128-natural/`：
 
 - `rounds.jsonl` / `rounds.rank1.jsonl`：每次verify的实际接受数，排除bonus；cold_start单独标记。
-- `selection-signals.rankN.jsonl/.f32`：按下一轮标记的每层/head选集分数统计。
-- `probability-signals.rankN.jsonl/.f32`：当前草稿每位置的α、q、p及首token熵/置信度。
-- `uniform-signals.rankN.jsonl/.f64`：实际用于拒绝判定的u，float64，按请求和轮次对齐；未使用位置填NaN。
-- `uniform-validation.json`：通过u和p/q重建首次拒绝点，核对原生接受长度，并检查TP两rank记录。
+- `selection-signals.rankN.jsonl/.f32`（需 `--record-signals`）：按下一轮标记的每层/head选集分数统计。
+- `probability-signals.rankN.jsonl/.f32`（需 `--record-signals`）：当前草稿每位置的α、q、p及首token熵/置信度。
+- `uniform-signals.rankN.jsonl/.f64`（需 `--record-signals`）：实际用于拒绝判定的u，float64，按请求和轮次对齐；未使用位置填NaN。
+- `uniform-validation.json`（需 `--record-signals`）：通过u和p/q重建首次拒绝点，核对原生接受长度，并检查TP两rank记录。
 - `request-audit.json`、`progress.rankN.json`、`engine/`、`worker-payload.json`、`runtime.log`：完成情况、进度、原结果和实际配置。
 
 新增u采集只截获原生函数返回的同一张量，不新增随机抽样。u仍在verify时生成；本版本没有实现提前抽u或依u提前停止draft。旧的k63扫描未记录u，不能把旧结果当作u方案的证据。
@@ -130,9 +138,40 @@ python -m experiments.acceptance.verify_uniforms \
   log/acceptance-k63-rscan/r0.05/lcb128-natural
 ```
 
+上述信号分析命令只用于历史已采集数据或显式开启 `--record-signals` 的新运行。
 分析生成接受长度分布图、统计表、请求隔离的5折上限预测和报告。`--fit-signals` 用于完整128请求数据，不用于4条短测。接受63仍是右删失，不代表真实上限恰好63。记录分数/u的额外归约和读回有观察开销，带诊断的耗时不能直接当作无诊断吞吐对照。
 
 `experiments/acceptance/reference/` 保存迁移时已完成结果的摘要快照，未包含大体积逐轮日志。旧k32文档为历史记录，其中相对链接仍指向当时的本地完整分析；新实验使用上述正式入口。
+
+### 可选实际 u 诊断：最新版动态准入、k 上限32
+
+`--dynamic-admission` 显式启用当前阶段容量准入、多 prefill、按需卸载／恢复及压力提前 Verify。
+`--max-num-batched-tokens 512` 是每轮 Prefill/Draft/Verify/重放共用的计算 token 预算。
+32768 是请求输入加输出的长度上限；动态准入不为每个活跃请求预约32768份 KV。
+未传 `--dynamic-admission` 的历史命令保留原先预约路径，不能与本路径混为一组。
+
+```bash
+python -u -m experiments.acceptance.run --model /data/models/Qwen3-8B \
+  --gpus 2,3 --k 32 --ratios .05 --dynamic-admission --record-signals \
+  --max-num-batched-tokens 512 --output log/acceptance-u-k32-dynamic
+```
+
+先完成实际 u/p/q 对齐验证，再运行 CPU 离线建模。可选建模依赖独立安装到仓库
+`.repro/analysis-packages/`，不替换推理环境的 NumPy/SciPy。使用 uv 时：
+
+```bash
+uv pip install --python "$VIRTUAL_ENV/bin/python" --target .repro/analysis-packages \
+  --no-deps -r repro/environment/analysis-requirements.txt
+python -m experiments.acceptance.analyze_uniforms \
+  --case log/acceptance-u-k32-dynamic/r0.05/lcb128-natural \
+  --output log/acceptance-u-k32-dynamic/analysis
+```
+
+`--descriptive-only` 可跳过建模，只生成实际 u 分箱拒绝率、接受长度分布和阈值候选表。
+完整建模使用请求隔离5折，比较历史状态与历史状态加本轮 u 的增量预测效果。
+当前轮 p/q 只作标签核验；仅过去轮次的 p/q 可作特征。因 u 仍在 Verify 时采集，
+此结果检验的是‘假设轮前已知这组 u’的信号价值，尚未改变采样时机或停止规则。
+正常短窗口单列；完整窗口上的预测结论不能直接外推到所有压力状态。
 
 ## 7. 验证范围
 

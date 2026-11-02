@@ -208,7 +208,35 @@ def _scatter_kv_pages(
              + kv[None, :] * dkv + head * dh + channel[None, :], value, mask=mask)
 
 
-def _pool_copy(source, destination, destination_page_ids, selection=None):
+@triton.jit
+def _restore_kv_pages_bounded(
+    source, destination, destination_pages, count,
+    layers: tl.constexpr, heads: tl.constexpr, dim: tl.constexpr,
+    sl, sp: tl.constexpr, skv: tl.constexpr, sh: tl.constexpr,
+    dl, dp: tl.constexpr, dkv: tl.constexpr, dh: tl.constexpr,
+    TOKENS: tl.constexpr, WIDTH: tl.constexpr,
+):
+    # A large mapped-host grid can occupy every SM's resident resources while
+    # waiting for PCIe, starving even independent metadata/GEMM kernels.
+    # Bound the whole grid and process all layer/head/token tiles in a loop.
+    tiles = tl.cdiv(count, TOKENS)
+    lane = tl.arange(0, WIDTH)
+    kv, channel = lane // dim, lane % dim
+    for task in range(tl.program_id(0), layers * heads * tiles, tl.num_programs(0)):
+        layer_head = task // tiles
+        layer = (layer_head // heads).to(tl.int64)
+        head = (layer_head % heads).to(tl.int64)
+        j = (task % tiles) * TOKENS + tl.arange(0, TOKENS)
+        dst_page = tl.load(destination_pages + j, mask=j < count, other=0).to(tl.int64)
+        mask = (j[:, None] < count) & (lane[None, :] < 2 * dim)
+        value = tl.load(source + layer * sl + j[:, None].to(tl.int64) * sp
+                        + kv[None, :] * skv + head * sh + channel[None, :],
+                        mask=mask, other=0)
+        tl.store(destination + layer * dl + dst_page[:, None] * dp
+                 + kv[None, :] * dkv + head * dh + channel[None, :], value, mask=mask)
+
+
+def _pool_copy(source, destination, destination_page_ids, selection=None, *, restore_programs=8):
     """Internal: callers validate ownership before submitting this stream work."""
     if (source.ndim != 6 or destination.ndim != 6 or source.shape[2:4] != (2, 1)
             or source.shape[0] != destination.shape[0] or source.shape[2:] != destination.shape[2:]
@@ -240,6 +268,17 @@ def _pool_copy(source, destination, destination_page_ids, selection=None):
         return
     indices = torch.tensor(pages, device=destination.device, dtype=torch.int32)
     with torch.cuda.device(destination.device):
+        if restore:
+            if type(restore_programs) is not int or restore_programs < 1:
+                raise ValueError("restore_programs must be a positive integer")
+            tasks = triton.cdiv(len(pages), 8) * source.shape[0] * source.shape[4]
+            _restore_kv_pages_bounded[(min(restore_programs, tasks),)](
+                source, destination, indices, len(pages), source.shape[0], source.shape[4], source.shape[5],
+                source.stride(0), source.stride(1), source.stride(2), source.stride(4),
+                destination.stride(0), destination.stride(1), destination.stride(2), destination.stride(4),
+                TOKENS=8, WIDTH=triton.next_power_of_2(2 * source.shape[5]), num_warps=8,
+            )
+            return
         _scatter_kv_pages[(triton.cdiv(len(pages), 8), source.shape[0], source.shape[4])](
             source, selection, destination, indices, len(pages), source.shape[4], source.shape[5],
             source.stride(0), source.stride(1), source.stride(2), source.stride(4), il, ih,
@@ -266,10 +305,12 @@ def gather_to_pool(pool, selected_pages, destination_page_ids, *, source_page_id
     _pool_copy(pool, pool, destinations, selected_pages)
 
 
-def restore_to_pool(cold_cpu, pool, destination_page_ids):
+def restore_to_pool(cold_cpu, pool, destination_page_ids, *, num_programs=8):
     """Scatter mapped pinned CPU slots directly into original GPU pool pages.
 
     Caller allocates destination pages, keeps cold_cpu alive, and waits for an
     event before publishing the combined verify page table. No GPU staging.
+    num_programs bounds the whole transfer grid so independent compute can
+    retain SM resources; eight is the measured A100 starting point.
     """
-    _pool_copy(cold_cpu, pool, destination_page_ids)
+    _pool_copy(cold_cpu, pool, destination_page_ids, restore_programs=num_programs)

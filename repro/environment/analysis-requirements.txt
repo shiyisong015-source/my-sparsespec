@@ -1,0 +1,4 @@
+# Optional CPU-only actual-u modeling dependencies; NumPy/SciPy use serving pins.
+scikit-learn==1.7.2
+joblib==1.5.2
+threadpoolctl==3.6.0

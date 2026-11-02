@@ -125,7 +125,13 @@ class CompactCachePtr(PillarCachePtr):
             self._owned.remove(page)
 
     def allocate_tokens(self, num_tokens, restore=False):
-        if self._pending is not None or self.needs_pack or restore or num_tokens != 1:
+        # A speculative reload only writes newly allocated cold destinations.
+        # Hot indices and the chronological append tail remain usable by Draft.
+        # Repack, in contrast, relocates that hot view and must park its request.
+        reloading = (self._pending is not None and self.phase == "hot"
+                     and self._pending.cold is None)
+        if ((self._pending is not None and not reloading)
+                or self.needs_pack or restore or num_tokens != 1):
             raise RuntimeError("Compact append requires one token at a completed phase boundary")
         pages = self._allocate(num_tokens)
         self.tail_pages.extend(pages)

@@ -35,7 +35,11 @@ def worker(path):
     payload = json.loads(path.read_text())
     scheduler_module = compact
     scheduler_name = "CompactSpecScheduler"
-    if payload["kwargs"].get("compact_async_transfers", False):
+    if payload["kwargs"].get("compact_dynamic_admission", False):
+        import serve.scheduler.dynamic_compact_scheduler as dynamic_compact
+        scheduler_module = dynamic_compact
+        scheduler_name = "DynamicCompactSpecScheduler"
+    elif payload["kwargs"].get("compact_async_transfers", False):
         if payload["kwargs"].get("async_cpu", False):
             import serve.scheduler.async_cpu_compact_scheduler as async_cpu_compact
             scheduler_module = async_cpu_compact
@@ -57,6 +61,8 @@ def worker(path):
         source_files.append(REPO / "serve/scheduler/async_compact_scheduler.py")
         if payload["kwargs"].get("async_cpu", False):
             source_files.append(REPO / "serve/scheduler/async_cpu_compact_scheduler.py")
+    if payload["kwargs"].get("compact_dynamic_admission", False):
+        source_files.append(REPO / "serve/scheduler/dynamic_compact_scheduler.py")
     save(output / f"worker-source-sha256.rank{rank}.json", {
         str(p.relative_to(REPO)): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_files})
     rows, caps = payload["requests"], payload["output_caps"]
